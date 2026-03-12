@@ -1,0 +1,288 @@
+"""
+converter.py - HTML to Markdown Conversion Module
+
+Handles Zhihu-specific LaTeX formulas, code blocks, image link rewriting, and content cleaning.
+
+Core strategy: Use placeholders to protect formulas during BeautifulSoup preprocessing,
+              then restore them as $ / $$ delimiters after markdownify conversion.
+
+================================================================================
+converter.py — HTML → Markdown 转换模块
+
+处理知乎特有的 LaTeX 公式、代码块、图片链接重写、垃圾内容清洗。
+
+核心策略：在 BeautifulSoup 阶段用占位符保护公式，
+         markdownify 转换后再还原为 $ / $$ 定界符。
+================================================================================
+"""
+
+import re
+import uuid
+
+from urllib.parse import urljoin
+from typing import Optional, Dict
+from bs4 import BeautifulSoup, Tag
+from markdownify import MarkdownConverter
+
+
+class ZhihuConverter:
+    """
+    Chinese: 知乎 HTML → Markdown 转换器
+    English: Zhihu HTML to Markdown converter
+
+    Each instance has an isolated formula store, no global state pollution.
+
+    Usage:
+        converter = ZhihuConverter(img_map={"https://...": "images/abc.jpg"})
+        markdown  = converter.convert(html_string)
+        img_urls  = ZhihuConverter.extract_image_urls(html_string)
+    """
+
+    # Placeholder prefix (alphanumeric only to avoid markdownify escaping)
+    # 占位符前缀（纯字母数字，避免被 markdownify 转义）
+    _PID = uuid.uuid4().hex[:8]
+    _INLINE_PH = f"IMATH{_PID}X"
+    _BLOCK_PH = f"BMATH{_PID}X"
+
+    def __init__(self, img_map: Optional[Dict[str, str]] = None):
+        self._img_map = img_map or {}
+        self._math_store: dict[str, str] = {}
+        self._math_counter = 0
+
+    # ── Formula Store (公式仓库) ─────────────────────────────────────────────
+
+    def _store_math(self, formula: str, is_block: bool) -> str:
+        """
+        Store formula in instance warehouse and return placeholder
+        将公式存入实例仓库，返回占位符
+        """
+        prefix = self._BLOCK_PH if is_block else self._INLINE_PH
+        key = f"{prefix}{self._math_counter}E"
+        self._math_store[key] = formula
+        self._math_counter += 1
+        return key
+
+    # ── Public Interface (对外接口) ─────────────────────────────────────────────
+
+    def convert(self, html: str) -> str:
+        """
+        One-step: HTML → Clean Markdown
+        一步到位：HTML → 清洁 Markdown
+        """
+        cleaned = self._preprocess(html)
+        md = self._to_markdown(cleaned)
+        return self._postprocess(md)
+
+    @staticmethod
+    def extract_image_urls(html: str) -> list[str]:
+        """
+        Extract all image URLs from HTML (excluding formula images and duplicate sizes)
+        从 HTML 中抽取所有需要下载的图片 URL（不含公式图片、不含重复尺寸）
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        urls: list[str] = []
+        seen_base: set[str] = set()  # For deduplicating similar theme images / 用于去重同主题图片
+
+        for img in soup.find_all("img"):
+            if "ztext-math" in (img.get("class") or []):
+                continue
+            src = (
+                img.get("data-actualsrc")
+                or img.get("data-original")
+                or img.get("src")
+                or ""
+            )
+            if not src or src.startswith("data:") or "noavatar" in src:
+                continue
+
+            # Extract base name for deduplication: v2-xxx_720w.jpg → v2-xxx
+            # 提取基础名用于去重：v2-xxx_720w.jpg → v2-xxx
+            # Zhihu image naming rules: v2-xxx_720w.jpg, v2-xxx_r.jpg
+            # 知乎图片命名规则：v2-xxx_720w.jpg, v2-xxx_r.jpg
+            base_name = src.split("/")[-1].split("?")[0]
+            for suffix in ["_720w", "_r", "_l"]:
+                if base_name.endswith(suffix + ".jpg"):
+                    base_name = base_name.replace(suffix + ".jpg", ".jpg")
+                    break
+                if base_name.endswith(suffix + ".png"):
+                    base_name = base_name.replace(suffix + ".png", ".png")
+                    break
+
+            # Skip if already seen similar theme image
+            # 如果已经见过同主题图片，跳过
+            if base_name in seen_base:
+                continue
+            seen_base.add(base_name)
+            urls.append(src)
+
+        return urls
+
+    # ── HTML Preprocessing (预处理 HTML) ──────────────────────────────────────────
+
+    def _preprocess(self, html: str) -> str:
+        """
+        Perform Zhihu-specific HTML cleaning before passing to markdownify
+        在交给 markdownify 之前做知乎特定的 HTML 清洗
+        """
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1) Remove interference elements: videos / cards / buttons / etc.
+        # 移除视频 / 卡片 / 按钮等干扰元素
+        for selector in (
+            "div.VideoCard, .RichText-video, .VideoCard-player",
+            ".LinkCard, .RichText-LinkCard, .Card, .Reward",
+            ".ContentItem-actions, .RichContent-actions",
+            ".Post-SideActions, .BottomActions",
+            ".css-1gomreu, .Voters",
+            "noscript",
+        ):
+            for tag in soup.select(selector):
+                tag.decompose()
+
+        # 2) Process math formulas
+        # 处理数学公式
+        #    Zhihu 2024+ format: <span class="ztext-math" data-tex="...">
+        #    Block formula's data-tex starts with \[ and ends with \]
+        #    知乎 2024+ 格式: <span class="ztext-math" data-tex="...">
+        #    块级公式的 data-tex 以 \[ 开头、\] 结尾
+        for span in soup.find_all("span", class_="ztext-math"):
+            tex = span.get("data-tex", "")
+            if not tex:
+                continue
+            is_block = tex.startswith(r"\[") and tex.endswith(r"\]")
+            if is_block:
+                tex = tex[2:-2].strip()
+            placeholder = self._store_math(tex, is_block)
+            marker = soup.new_tag("var")
+            marker.string = placeholder
+            span.replace_with(marker)
+
+        #    Legacy format: <img class="ztext-math" data-formula="...">
+        #    兼容旧版: <img class="ztext-math" data-formula="...">
+        for img in soup.select("img.ztext-math"):
+            formula = img.get("data-formula", "")
+            if not formula:
+                continue
+            is_block = (
+                img.parent
+                and img.parent.name in ("p", "div", "figure")
+                and len(img.parent.get_text(strip=True)) == 0
+            )
+            placeholder = self._store_math(formula, is_block)
+            marker = soup.new_tag("var")
+            marker.string = placeholder
+            img.replace_with(marker)
+
+        # 3) Replace <br> in <code> with newlines
+        # <code> 里的 <br> 换成换行符
+        for code in soup.find_all("code"):
+            for br in code.find_all("br"):
+                br.replace_with("\n")
+
+        # 4) Code block language labels
+        # 代码块语言标注
+        for pre in soup.find_all("pre"):
+            code = pre.find("code")
+            if code:
+                lang = ""
+                for cls in code.get("class", []):
+                    if cls.startswith("language-"):
+                        lang = cls[len("language-"):]
+                        break
+                if lang:
+                    code["class"] = [f"language-{lang}"]
+
+        return str(soup)
+
+    # ── markdownify Bridge (markdownify 桥接) ─────────────────────────────────────
+
+    def _to_markdown(self, html: str) -> str:
+        """
+        Call markdownify with custom image handling logic
+        调用 markdownify，使用自定义的图片处理逻辑
+        """
+        md_converter = _MarkdownBridge(
+            img_map=self._img_map,
+            heading_style="atx",
+            bullets="-",
+            strip=["script", "style", "noscript"],
+        )
+        return md_converter.convert(html)
+
+    # ── Markdown Post-processing (后处理 Markdown) ──────────────────────────────────────
+
+    def _postprocess(self, md: str) -> str:
+        """
+        Clean noise + restore formula placeholders
+        清理噪音 + 还原公式占位符
+        """
+        # Compress consecutive blank lines
+        # 压缩连续空行
+        md = re.sub(r"\n{3,}", "\n\n", md)
+        # Clean trailing whitespace
+        # 清理行尾空白
+        md = "\n".join(line.rstrip() for line in md.splitlines())
+
+        # Restore formulas (with KaTeX compatibility fix)
+        # 还原公式 (并做 KaTeX 兼容性处理)
+        for key, formula in self._math_store.items():
+            fixed_formula = self._fix_katex_array(formula)
+            if key.startswith(self._BLOCK_PH):
+                md = md.replace(key, f"\n\n$$\n{fixed_formula}\n$$\n\n")
+            elif key.startswith(self._INLINE_PH):
+                md = md.replace(key, f"${fixed_formula}$")
+
+        # Compress again
+        # 再次压缩
+        md = re.sub(r"\n{3,}", "\n\n", md)
+        return md.strip() + "\n"
+
+    @staticmethod
+    def _fix_katex_array(formula: str) -> str:
+        """
+        Fix KaTeX unsupported array column definition syntax.
+        GitHub's KaTeX doesn't recognize {*{N}{X}} repeat syntax, needs expansion.
+        Example: {*{20}{c}} → {cccccccccccccccccccc}
+
+        修复 KaTeX 不支持的 array 列定义语法。
+        GitHub 的 KaTeX 不识别 {*{N}{X}} 这种重复语法，需要展开。
+        例如: {*{20}{c}} → {cccccccccccccccccccc}
+        """
+        def expand_repeat(match):
+            count = int(match.group(1))
+            char = match.group(2)
+            return char * count
+
+        # Match *{digit}{single_char} and expand
+        # 匹配 *{数字}{单字符} 并展开
+        return re.sub(r'\*\{(\d+)\}\{(.)\}', expand_repeat, formula)
+
+
+# ── markdownify Internal Bridge Class (不对外暴露) ──────────────────────
+
+class _MarkdownBridge(MarkdownConverter):
+    """
+    Inherit markdownify, only override image tag conversion logic
+    继承 markdownify，仅覆盖图片标签的转换逻辑
+    """
+
+    def __init__(self, img_map: Optional[Dict[str, str]] = None, **kwargs):
+        self.img_map = img_map or {}
+        super().__init__(**kwargs)
+
+    def convert_img(self, el: Tag, text: str, parent_tags: set) -> str:
+        src = (
+            el.get("data-actualsrc")
+            or el.get("data-original")
+            or el.get("src")
+            or ""
+        )
+        if not src:
+            return ""
+        if "zhihu.com/equation" not in src and any(
+            kw in src for kw in ["data:image", "noavatar"]
+        ):
+            return ""
+        alt = el.get("alt", "")
+        local = self.img_map.get(src, src)
+        return f"![{alt}]({local})\n\n"
