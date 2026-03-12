@@ -1,0 +1,29 @@
+[project]
+name = "zhihu-answer-analysis-report-skill"
+version = "0.1.0"
+description = "Standalone Codex skill for crawling Zhihu question answers and generating Markdown analysis reports."
+readme = "SKILL.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Chen Xirui", email = "smartloe@qq.com" }
+]
+dependencies = [
+    "curl_cffi>=0.14.0",
+    "markdownify>=0.14.1",
+    "beautifulsoup4>=4.12.3",
+    "httpx>=0.28.1",
+    "PyExecJS>=1.5.1",
+    "pyyaml>=6.0",
+    "structlog==24.4.0",
+    "jieba>=0.42.1",
+    "snownlp>=0.12.3",
+    "wordcloud>=1.9.4",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*"]
