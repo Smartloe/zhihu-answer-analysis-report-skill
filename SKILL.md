@@ -57,7 +57,7 @@ python3 scripts/zhihu_answer_report.py \
 4. Generate outputs.
    `report.md`: the final Markdown report.
    `analysis/wordcloud.png`: static word cloud image.
-   `analysis/dashboard.html`: interactive ECharts dashboard.
+   `analysis/dashboard.html`: responsive ECharts dashboard with a desktop two-column card layout and mobile single-column fallback.
    `analysis/summary.json`: structured metrics.
    `analysis/answers.jsonl`: row-level answer dataset for reuse.
    `raw/entries/*/index.md` and `raw/zhihu.db`: raw scrape artifacts when running from a URL.

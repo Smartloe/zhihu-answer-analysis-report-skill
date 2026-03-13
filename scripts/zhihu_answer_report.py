@@ -594,6 +594,10 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     top_keywords = summary["top_keywords"][:20]
     timeline = summary["timeline"]
     sentiment_buckets = summary["sentiment_buckets"]
+    sentiment_labels = summary.get("sentiment_labels", {})
+    question_title = summary.get("question_title") or "知乎回答分析"
+    average_sentiment = summary.get("average_sentiment")
+    average_sentiment_display = average_sentiment if average_sentiment is not None else "N/A"
 
     scatter_points = []
     for record in records:
@@ -618,69 +622,317 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f8f5ef;
+      --bg: #f6f1e7;
       --panel: #fffdf9;
+      --panel-soft: rgba(255, 255, 255, 0.78);
       --ink: #1f2328;
-      --line: #d9cfc1;
+      --muted: #665f56;
+      --line: rgba(120, 95, 61, 0.16);
+      --accent: #c96d3a;
+      --accent-soft: rgba(201, 109, 58, 0.12);
+      --shadow: 0 18px 48px rgba(67, 46, 22, 0.12);
+    }}
+    * {{
+      box-sizing: border-box;
     }}
     body {{
       margin: 0;
-      padding: 24px;
-      background: radial-gradient(circle at top, #fff4df, var(--bg));
+      min-height: 100vh;
+      padding: clamp(18px, 3vw, 32px);
+      background:
+        radial-gradient(circle at top left, rgba(255, 228, 181, 0.8), transparent 30%),
+        radial-gradient(circle at top right, rgba(76, 122, 175, 0.18), transparent 24%),
+        linear-gradient(180deg, #fbf6ed 0%, var(--bg) 100%);
       color: var(--ink);
-      font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+      font-family: "Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif;
     }}
-    h1 {{
-      margin: 0 0 8px;
-      font-size: 28px;
-    }}
-    p {{
-      margin: 0 0 24px;
-      color: #5a544c;
-    }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    .shell {{
+      max-width: 1440px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
       gap: 18px;
     }}
-    .card {{
+    .hero {{
+      display: flex;
+      align-items: stretch;
+      justify-content: space-between;
+      gap: 20px;
+      padding: clamp(22px, 3vw, 32px);
+      background:
+        linear-gradient(135deg, rgba(255, 244, 223, 0.96), rgba(255, 253, 249, 0.94)),
+        var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }}
+    .hero-copy {{
+      flex: 1;
+      min-width: 0;
+    }}
+    .hero-kicker {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }}
+    h1 {{
+      margin: 14px 0 10px;
+      font-size: clamp(30px, 5vw, 44px);
+      line-height: 1.08;
+    }}
+    .lead {{
+      margin: 0;
+      max-width: 64ch;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.7;
+    }}
+    .hero-note {{
+      width: min(300px, 100%);
+      padding: 20px 22px;
+      border-radius: 24px;
+      background: var(--panel-soft);
+      border: 1px solid rgba(76, 122, 175, 0.18);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 10px;
+      backdrop-filter: blur(12px);
+    }}
+    .note-label,
+    .stat-label,
+    .panel-tag {{
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }}
+    .note-value {{
+      font-size: clamp(26px, 3.5vw, 34px);
+      font-weight: 700;
+      line-height: 1.1;
+    }}
+    .note-caption,
+    .stat-note,
+    .panel-desc {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }}
+    .stats {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+    }}
+    .stat-card,
+    .panel {{
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 16px;
-      box-shadow: 0 10px 30px rgba(46, 30, 13, 0.08);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+    }}
+    .stat-card {{
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .stat-value {{
+      font-size: clamp(26px, 3.6vw, 38px);
+      font-weight: 700;
+      line-height: 1.05;
+    }}
+    .dashboard {{
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 18px;
+      align-items: stretch;
+    }}
+    .panel {{
+      grid-column: span 6;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      overflow: hidden;
+    }}
+    .panel-wide {{
+      grid-column: span 7;
+    }}
+    .panel-narrow {{
+      grid-column: span 5;
+    }}
+    .panel-head {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 14px;
+    }}
+    .panel-head h2 {{
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.25;
     }}
     .chart {{
       width: 100%;
+      min-width: 0;
+    }}
+    .chart-lg {{
+      height: 420px;
+    }}
+    .chart-md {{
       height: 360px;
+    }}
+    @media (max-width: 1180px) {{
+      .stats {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .panel,
+      .panel-wide,
+      .panel-narrow {{
+        grid-column: span 6;
+      }}
+    }}
+    @media (max-width: 820px) {{
+      body {{
+        padding: 16px;
+      }}
+      .hero {{
+        flex-direction: column;
+      }}
+      .hero-note {{
+        width: 100%;
+      }}
+      .stats {{
+        grid-template-columns: 1fr;
+      }}
+      .dashboard {{
+        grid-template-columns: 1fr;
+      }}
+      .panel,
+      .panel-wide,
+      .panel-narrow {{
+        grid-column: auto;
+      }}
+      .chart-lg,
+      .chart-md {{
+        height: 320px;
+      }}
     }}
   </style>
 </head>
 <body>
-  <h1>{summary.get("question_title") or "知乎回答分析"}</h1>
-  <p>回答数 {summary.get("answer_count", 0)}，平均情感分 {summary.get("average_sentiment")}, 平均字数 {summary.get("average_characters")}。</p>
-  <div class="grid">
-    <section class="card"><div id="keywords" class="chart"></div></section>
-    <section class="card"><div id="sentiment" class="chart"></div></section>
-    <section class="card"><div id="timeline" class="chart"></div></section>
-    <section class="card"><div id="scatter" class="chart"></div></section>
-  </div>
+  <main class="shell">
+    <section class="hero">
+      <div class="hero-copy">
+        <span class="hero-kicker">Zhihu Insight Dashboard</span>
+        <h1>{question_title}</h1>
+        <p class="lead">共分析 {summary.get("answer_count", 0)} 条回答，累计 {summary.get("total_characters", 0)} 字。看板默认采用双列卡片布局，在窄屏场景下自动切换为单列，避免图表被硬塞进同一行。</p>
+      </div>
+      <aside class="hero-note">
+        <span class="note-label">情绪切片</span>
+        <strong class="note-value">{sentiment_labels.get("positive", 0)} / {sentiment_labels.get("neutral", 0)} / {sentiment_labels.get("negative", 0)}</strong>
+        <span class="note-caption">正向 / 中性 / 负向回答数</span>
+      </aside>
+    </section>
+
+    <section class="stats">
+      <article class="stat-card">
+        <span class="stat-label">回答总数</span>
+        <strong class="stat-value">{summary.get("answer_count", 0)}</strong>
+        <span class="stat-note">累计字数 {summary.get("total_characters", 0)}</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">平均字数</span>
+        <strong class="stat-value">{summary.get("average_characters", 0)}</strong>
+        <span class="stat-note">中位数字数 {summary.get("median_characters", 0)}</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">平均情感分</span>
+        <strong class="stat-value">{average_sentiment_display}</strong>
+        <span class="stat-note">标准差 {summary.get("sentiment_stddev", "N/A")}</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">作者浓度</span>
+        <strong class="stat-value">{len(summary.get("top_authors", []))}</strong>
+        <span class="stat-note">看板展示前 10 位高频作者</span>
+      </article>
+    </section>
+
+    <section class="dashboard">
+      <article class="panel panel-wide">
+        <div class="panel-head">
+          <span class="panel-tag">Topic Language</span>
+          <h2>高频关键词 Top 20</h2>
+          <p class="panel-desc">观察回答里的核心讨论主题与词频热度。</p>
+        </div>
+        <div id="keywords" class="chart chart-lg"></div>
+      </article>
+
+      <article class="panel panel-narrow">
+        <div class="panel-head">
+          <span class="panel-tag">Sentiment Curve</span>
+          <h2>情感分布</h2>
+          <p class="panel-desc">按分数区间观察回答整体偏正向还是偏负向。</p>
+        </div>
+        <div id="sentiment" class="chart chart-lg"></div>
+      </article>
+
+      <article class="panel panel-narrow">
+        <div class="panel-head">
+          <span class="panel-tag">Activity Rhythm</span>
+          <h2>回答时间线</h2>
+          <p class="panel-desc">按日期查看回答发布节奏是否有集中爆发。</p>
+        </div>
+        <div id="timeline" class="chart chart-md"></div>
+      </article>
+
+      <article class="panel panel-wide">
+        <div class="panel-head">
+          <span class="panel-tag">Engagement Map</span>
+          <h2>字数 / 赞同 / 情感</h2>
+          <p class="panel-desc">同时观察篇幅、赞同数与情感分之间的关系。</p>
+        </div>
+        <div id="scatter" class="chart chart-md"></div>
+      </article>
+    </section>
+  </main>
   <script>
     const topKeywords = {json.dumps(top_keywords, ensure_ascii=False)};
     const sentimentBuckets = {json.dumps(sentiment_buckets, ensure_ascii=False)};
     const timeline = {json.dumps(timeline, ensure_ascii=False)};
     const scatterPoints = {json.dumps(scatter_points, ensure_ascii=False)};
+    const axisLabelColor = '#615949';
+    const splitLineColor = 'rgba(109, 94, 72, 0.16)';
 
     const keywordChart = echarts.init(document.getElementById('keywords'));
     keywordChart.setOption({{
-      title: {{ text: '高频关键词 Top 20' }},
-      tooltip: {{}},
+      animationDuration: 700,
+      grid: {{ left: 48, right: 22, top: 16, bottom: 74 }},
+      tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
       xAxis: {{
         type: 'category',
         data: topKeywords.map(item => item.word),
-        axisLabel: {{ rotate: 35 }}
+        axisLabel: {{ rotate: 34, color: axisLabelColor }},
+        axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
+        axisTick: {{ show: false }}
       }},
-      yAxis: {{ type: 'value' }},
+      yAxis: {{
+        type: 'value',
+        axisLabel: {{ color: axisLabelColor }},
+        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
+      }},
       series: [{{
         type: 'bar',
         data: topKeywords.map(item => item.count),
@@ -692,25 +944,48 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     const bucketOrder = ['0.0-0.2', '0.2-0.4', '0.4-0.6', '0.6-0.8', '0.8-1.0', 'unknown'];
     const sentimentChart = echarts.init(document.getElementById('sentiment'));
     sentimentChart.setOption({{
-      title: {{ text: '情感分布' }},
-      tooltip: {{}},
-      xAxis: {{ type: 'category', data: bucketOrder }},
-      yAxis: {{ type: 'value' }},
+      animationDuration: 700,
+      grid: {{ left: 42, right: 18, top: 16, bottom: 42 }},
+      tooltip: {{ trigger: 'axis' }},
+      xAxis: {{
+        type: 'category',
+        data: bucketOrder,
+        axisLabel: {{ color: axisLabelColor }},
+        axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
+        axisTick: {{ show: false }}
+      }},
+      yAxis: {{
+        type: 'value',
+        axisLabel: {{ color: axisLabelColor }},
+        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
+      }},
       series: [{{
         type: 'line',
         smooth: true,
         data: bucketOrder.map(name => sentimentBuckets[name] || 0),
         lineStyle: {{ color: '#287271', width: 3 }},
-        areaStyle: {{ color: 'rgba(40, 114, 113, 0.18)' }}
+        areaStyle: {{ color: 'rgba(40, 114, 113, 0.18)' }},
+        itemStyle: {{ color: '#287271' }}
       }}]
     }});
 
     const timelineChart = echarts.init(document.getElementById('timeline'));
     timelineChart.setOption({{
-      title: {{ text: '回答时间线' }},
-      tooltip: {{}},
-      xAxis: {{ type: 'category', data: timeline.map(item => item.date), axisLabel: {{ rotate: 35 }} }},
-      yAxis: {{ type: 'value' }},
+      animationDuration: 700,
+      grid: {{ left: 48, right: 18, top: 16, bottom: 74 }},
+      tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
+      xAxis: {{
+        type: 'category',
+        data: timeline.map(item => item.date),
+        axisLabel: {{ rotate: 34, color: axisLabelColor }},
+        axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
+        axisTick: {{ show: false }}
+      }},
+      yAxis: {{
+        type: 'value',
+        axisLabel: {{ color: axisLabelColor }},
+        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
+      }},
       series: [{{
         type: 'bar',
         data: timeline.map(item => item.count),
@@ -721,15 +996,29 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
 
     const scatterChart = echarts.init(document.getElementById('scatter'));
     scatterChart.setOption({{
-      title: {{ text: '字数 / 赞同 / 情感' }},
+      animationDuration: 700,
+      grid: {{ left: 54, right: 28, top: 20, bottom: 72 }},
       tooltip: {{
         formatter: params => {{
           const data = params.data;
-          return `${{data[3]}}<br>字数: ${{data[0]}}<br>赞同: ${{data[1]}}<br>情感: ${{data[2]}}`;
+          const title = data[3] || '未命名回答';
+          return `${{title}}<br>字数: ${{data[0]}}<br>赞同: ${{data[1]}}<br>情感: ${{data[2]}}`;
         }}
       }},
-      xAxis: {{ type: 'value', name: '字数' }},
-      yAxis: {{ type: 'value', name: '赞同数' }},
+      xAxis: {{
+        type: 'value',
+        name: '字数',
+        nameTextStyle: {{ color: axisLabelColor }},
+        axisLabel: {{ color: axisLabelColor }},
+        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
+      }},
+      yAxis: {{
+        type: 'value',
+        name: '赞同数',
+        nameTextStyle: {{ color: axisLabelColor }},
+        axisLabel: {{ color: axisLabelColor }},
+        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
+      }},
       visualMap: {{
         min: 0,
         max: 1,
@@ -746,12 +1035,32 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       }}]
     }});
 
-    window.addEventListener('resize', () => {{
-      keywordChart.resize();
-      sentimentChart.resize();
-      timelineChart.resize();
-      scatterChart.resize();
-    }});
+    const charts = [keywordChart, sentimentChart, timelineChart, scatterChart];
+    const syncFrameHeight = () => {{
+      const frame = window.frameElement;
+      if (!frame) {{
+        return;
+      }}
+      try {{
+        frame.style.height = `${{document.documentElement.scrollHeight + 24}}px`;
+      }} catch (_error) {{
+        // Ignore iframe sizing failures when opened directly.
+      }}
+    }};
+
+    const resizeCharts = () => {{
+      charts.forEach(chart => chart.resize());
+      syncFrameHeight();
+    }};
+
+    window.addEventListener('load', syncFrameHeight);
+    window.addEventListener('resize', resizeCharts);
+    if ('ResizeObserver' in window) {{
+      const observer = new ResizeObserver(() => syncFrameHeight());
+      observer.observe(document.body);
+    }}
+    setTimeout(syncFrameHeight, 300);
+    setTimeout(syncFrameHeight, 900);
   </script>
 </body>
 </html>
@@ -857,7 +1166,7 @@ def write_report(
             "",
             "<div style=\"margin: 16px 0 24px;\">",
             f"<iframe src=\"{dashboard_rel}\" title=\"ECharts Dashboard\" "
-            "style=\"width: 100%; min-height: 1580px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
+            "style=\"width: 100%; min-height: 1720px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
             "loading=\"lazy\"></iframe>",
             "</div>",
             "",
