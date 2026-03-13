@@ -507,6 +507,7 @@ def build_summary(
     bucket_counts = Counter(sentiment_bucket(record.get("sentiment")) for record in records)
     timeline = Counter(record.get("date") or "unknown" for record in records)
     authors = Counter(record.get("author") or "Unknown" for record in records)
+    known_dates = sorted(date for date in timeline if date != "unknown")
 
     if upvote_records:
         top_answers = sorted(
@@ -528,6 +529,7 @@ def build_summary(
         "question_id": prepared.question_id,
         "question_title": prepared.question_title,
         "answer_count": len(records),
+        "author_count": len(authors),
         "total_characters": sum(char_counts),
         "average_characters": round(sum(char_counts) / len(char_counts), 2) if char_counts else 0,
         "median_characters": statistics.median(char_counts) if char_counts else 0,
@@ -547,6 +549,11 @@ def build_summary(
             {"date": date, "count": count}
             for date, count in sorted(timeline.items())
         ],
+        "date_range": (
+            {"start": known_dates[0], "end": known_dates[-1]}
+            if known_dates
+            else None
+        ),
         "top_answers": [
             {
                 "title": item.get("title", ""),
@@ -598,6 +605,29 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     question_title = summary.get("question_title") or "知乎回答分析"
     average_sentiment = summary.get("average_sentiment")
     average_sentiment_display = average_sentiment if average_sentiment is not None else "N/A"
+    positive_count = sentiment_labels.get("positive", 0)
+    neutral_count = sentiment_labels.get("neutral", 0)
+    negative_count = sentiment_labels.get("negative", 0)
+    author_count = summary.get("author_count") or len({record.get("author") or "Unknown" for record in records})
+    leading_keyword = top_keywords[0]["word"] if top_keywords else "N/A"
+    date_range = summary.get("date_range") or {}
+    date_start = date_range.get("start")
+    date_end = date_range.get("end")
+    if date_start and date_end:
+        date_range_display = f"{date_start} - {date_end}" if date_start != date_end else date_start
+    elif date_start or date_end:
+        date_range_display = date_start or date_end
+    else:
+        date_range_display = "未提供"
+    bucket_order = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0", "unknown"]
+    dominant_bucket = max(
+        [name for name in bucket_order if name != "unknown"],
+        key=lambda name: sentiment_buckets.get(name, 0),
+        default="unknown",
+    )
+    dominant_bucket_count = sentiment_buckets.get(dominant_bucket, 0)
+    timeline_peak = max(timeline, key=lambda item: item.get("count", 0), default={"date": "N/A", "count": 0})
+    timeline_peak_label = f"{timeline_peak.get('date', 'N/A')} / {timeline_peak.get('count', 0)} 条"
 
     scatter_points = []
     for record in records:
@@ -611,6 +641,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
                 record.get("title", ""),
             ]
         )
+    scatter_count = len(scatter_points)
 
     html = f"""<!doctype html>
 <html lang="zh-CN">
@@ -630,6 +661,11 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       --line: rgba(120, 95, 61, 0.16);
       --accent: #c96d3a;
       --accent-soft: rgba(201, 109, 58, 0.12);
+      --teal: #287271;
+      --blue: #4c7aaf;
+      --positive: #2f855a;
+      --neutral: #b08929;
+      --negative: #9b3d3d;
       --shadow: 0 18px 48px rgba(67, 46, 22, 0.12);
     }}
     * {{
@@ -645,6 +681,18 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         linear-gradient(180deg, #fbf6ed 0%, var(--bg) 100%);
       color: var(--ink);
       font-family: "Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif;
+      position: relative;
+    }}
+    body::before {{
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(108, 93, 72, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(108, 93, 72, 0.035) 1px, transparent 1px);
+      background-size: 24px 24px;
+      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.42), transparent 72%);
     }}
     .shell {{
       max-width: 1440px;
@@ -666,6 +714,19 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       border-radius: 28px;
       box-shadow: var(--shadow);
       overflow: hidden;
+      position: relative;
+      isolation: isolate;
+    }}
+    .hero::after {{
+      content: "";
+      position: absolute;
+      right: -8%;
+      bottom: -36%;
+      width: 320px;
+      height: 320px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(76, 122, 175, 0.22), transparent 70%);
+      z-index: -1;
     }}
     .hero-copy {{
       flex: 1;
@@ -696,6 +757,34 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       font-size: 15px;
       line-height: 1.7;
     }}
+    .hero-meta {{
+      margin-top: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }}
+    .meta-chip {{
+      min-width: 148px;
+      padding: 12px 14px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.74);
+      border: 1px solid rgba(120, 95, 61, 0.1);
+      box-shadow: 0 10px 24px rgba(67, 46, 22, 0.06);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    .meta-chip span {{
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }}
+    .meta-chip strong {{
+      font-size: 16px;
+      line-height: 1.25;
+    }}
     .hero-note {{
       width: min(300px, 100%);
       padding: 20px 22px;
@@ -723,6 +812,36 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       font-weight: 700;
       line-height: 1.1;
     }}
+    .hero-breakdown {{
+      display: grid;
+      gap: 10px;
+      margin-top: 8px;
+    }}
+    .breakdown-row {{
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }}
+    .breakdown-dot {{
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+    }}
+    .breakdown-dot.positive {{
+      background: var(--positive);
+    }}
+    .breakdown-dot.neutral {{
+      background: var(--neutral);
+    }}
+    .breakdown-dot.negative {{
+      background: var(--negative);
+    }}
+    .breakdown-row strong {{
+      color: var(--ink);
+    }}
     .note-caption,
     .stat-note,
     .panel-desc {{
@@ -748,6 +867,18 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       flex-direction: column;
       gap: 8px;
     }}
+    .stat-card:nth-child(1) {{
+      background: linear-gradient(180deg, rgba(201, 109, 58, 0.09), rgba(255, 253, 249, 0.96) 55%);
+    }}
+    .stat-card:nth-child(2) {{
+      background: linear-gradient(180deg, rgba(76, 122, 175, 0.1), rgba(255, 253, 249, 0.96) 55%);
+    }}
+    .stat-card:nth-child(3) {{
+      background: linear-gradient(180deg, rgba(40, 114, 113, 0.1), rgba(255, 253, 249, 0.96) 55%);
+    }}
+    .stat-card:nth-child(4) {{
+      background: linear-gradient(180deg, rgba(176, 137, 41, 0.11), rgba(255, 253, 249, 0.96) 55%);
+    }}
     .stat-value {{
       font-size: clamp(26px, 3.6vw, 38px);
       font-weight: 700;
@@ -767,6 +898,18 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       min-width: 0;
       overflow: hidden;
     }}
+    .panel-heat {{
+      background: linear-gradient(180deg, rgba(201, 109, 58, 0.09), rgba(255, 253, 249, 0.98) 34%);
+    }}
+    .panel-tone {{
+      background: linear-gradient(180deg, rgba(40, 114, 113, 0.1), rgba(255, 253, 249, 0.98) 34%);
+    }}
+    .panel-rhythm {{
+      background: linear-gradient(180deg, rgba(76, 122, 175, 0.1), rgba(255, 253, 249, 0.98) 34%);
+    }}
+    .panel-map {{
+      background: linear-gradient(180deg, rgba(107, 29, 29, 0.08), rgba(255, 253, 249, 0.98) 34%);
+    }}
     .panel-wide {{
       grid-column: span 7;
     }}
@@ -779,10 +922,30 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       gap: 6px;
       margin-bottom: 14px;
     }}
+    .panel-topline {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }}
     .panel-head h2 {{
       margin: 0;
       font-size: 20px;
       line-height: 1.25;
+    }}
+    .panel-metric {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.84);
+      border: 1px solid rgba(120, 95, 61, 0.12);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
     }}
     .chart {{
       width: 100%;
@@ -814,6 +977,10 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       .hero-note {{
         width: 100%;
       }}
+      .hero-meta {{
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
       .stats {{
         grid-template-columns: 1fr;
       }}
@@ -829,6 +996,17 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       .chart-md {{
         height: 320px;
       }}
+      .panel-topline {{
+        flex-direction: column;
+      }}
+      .panel-metric {{
+        white-space: normal;
+      }}
+    }}
+    @media (max-width: 560px) {{
+      .hero-meta {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
@@ -839,11 +1017,42 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         <span class="hero-kicker">Zhihu Insight Dashboard</span>
         <h1>{question_title}</h1>
         <p class="lead">共分析 {summary.get("answer_count", 0)} 条回答，累计 {summary.get("total_characters", 0)} 字。看板默认采用双列卡片布局，在窄屏场景下自动切换为单列，避免图表被硬塞进同一行。</p>
+        <div class="hero-meta">
+          <article class="meta-chip">
+            <span>时间跨度</span>
+            <strong>{date_range_display}</strong>
+          </article>
+          <article class="meta-chip">
+            <span>活跃作者</span>
+            <strong>{author_count}</strong>
+          </article>
+          <article class="meta-chip">
+            <span>领跑关键词</span>
+            <strong>{leading_keyword}</strong>
+          </article>
+        </div>
       </div>
       <aside class="hero-note">
         <span class="note-label">情绪切片</span>
-        <strong class="note-value">{sentiment_labels.get("positive", 0)} / {sentiment_labels.get("neutral", 0)} / {sentiment_labels.get("negative", 0)}</strong>
-        <span class="note-caption">正向 / 中性 / 负向回答数</span>
+        <strong class="note-value">{average_sentiment_display}</strong>
+        <span class="note-caption">平均情感分，越接近 1 越偏正向。</span>
+        <div class="hero-breakdown">
+          <div class="breakdown-row">
+            <span class="breakdown-dot positive"></span>
+            <span>正向</span>
+            <strong>{positive_count}</strong>
+          </div>
+          <div class="breakdown-row">
+            <span class="breakdown-dot neutral"></span>
+            <span>中性</span>
+            <strong>{neutral_count}</strong>
+          </div>
+          <div class="breakdown-row">
+            <span class="breakdown-dot negative"></span>
+            <span>负向</span>
+            <strong>{negative_count}</strong>
+          </div>
+        </div>
       </aside>
     </section>
 
@@ -852,6 +1061,11 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         <span class="stat-label">回答总数</span>
         <strong class="stat-value">{summary.get("answer_count", 0)}</strong>
         <span class="stat-note">累计字数 {summary.get("total_characters", 0)}</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">活跃作者</span>
+        <strong class="stat-value">{author_count}</strong>
+        <span class="stat-note">报告正文会列出前 10 位高频作者</span>
       </article>
       <article class="stat-card">
         <span class="stat-label">平均字数</span>
@@ -863,45 +1077,60 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         <strong class="stat-value">{average_sentiment_display}</strong>
         <span class="stat-note">标准差 {summary.get("sentiment_stddev", "N/A")}</span>
       </article>
-      <article class="stat-card">
-        <span class="stat-label">作者浓度</span>
-        <strong class="stat-value">{len(summary.get("top_authors", []))}</strong>
-        <span class="stat-note">看板展示前 10 位高频作者</span>
-      </article>
     </section>
 
     <section class="dashboard">
-      <article class="panel panel-wide">
+      <article class="panel panel-wide panel-heat">
         <div class="panel-head">
-          <span class="panel-tag">Topic Language</span>
-          <h2>高频关键词 Top 20</h2>
+          <div class="panel-topline">
+            <div>
+              <span class="panel-tag">Topic Language</span>
+              <h2>高频关键词 Top 20</h2>
+            </div>
+            <span class="panel-metric">Top 1: {leading_keyword}</span>
+          </div>
           <p class="panel-desc">观察回答里的核心讨论主题与词频热度。</p>
         </div>
         <div id="keywords" class="chart chart-lg"></div>
       </article>
 
-      <article class="panel panel-narrow">
+      <article class="panel panel-narrow panel-tone">
         <div class="panel-head">
-          <span class="panel-tag">Sentiment Curve</span>
-          <h2>情感分布</h2>
+          <div class="panel-topline">
+            <div>
+              <span class="panel-tag">Sentiment Curve</span>
+              <h2>情感分布</h2>
+            </div>
+            <span class="panel-metric">主峰: {dominant_bucket} / {dominant_bucket_count} 条</span>
+          </div>
           <p class="panel-desc">按分数区间观察回答整体偏正向还是偏负向。</p>
         </div>
         <div id="sentiment" class="chart chart-lg"></div>
       </article>
 
-      <article class="panel panel-narrow">
+      <article class="panel panel-narrow panel-rhythm">
         <div class="panel-head">
-          <span class="panel-tag">Activity Rhythm</span>
-          <h2>回答时间线</h2>
+          <div class="panel-topline">
+            <div>
+              <span class="panel-tag">Activity Rhythm</span>
+              <h2>回答时间线</h2>
+            </div>
+            <span class="panel-metric">峰值: {timeline_peak_label}</span>
+          </div>
           <p class="panel-desc">按日期查看回答发布节奏是否有集中爆发。</p>
         </div>
         <div id="timeline" class="chart chart-md"></div>
       </article>
 
-      <article class="panel panel-wide">
+      <article class="panel panel-wide panel-map">
         <div class="panel-head">
-          <span class="panel-tag">Engagement Map</span>
-          <h2>字数 / 赞同 / 情感</h2>
+          <div class="panel-topline">
+            <div>
+              <span class="panel-tag">Engagement Map</span>
+              <h2>字数 / 赞同 / 情感</h2>
+            </div>
+            <span class="panel-metric">样本点: {scatter_count}</span>
+          </div>
           <p class="panel-desc">同时观察篇幅、赞同数与情感分之间的关系。</p>
         </div>
         <div id="scatter" class="chart chart-md"></div>
@@ -913,14 +1142,21 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     const sentimentBuckets = {json.dumps(sentiment_buckets, ensure_ascii=False)};
     const timeline = {json.dumps(timeline, ensure_ascii=False)};
     const scatterPoints = {json.dumps(scatter_points, ensure_ascii=False)};
+    const bucketOrder = {json.dumps(bucket_order, ensure_ascii=False)};
     const axisLabelColor = '#615949';
     const splitLineColor = 'rgba(109, 94, 72, 0.16)';
+    const tooltipTheme = {{
+      backgroundColor: 'rgba(31, 26, 21, 0.94)',
+      borderWidth: 0,
+      padding: [10, 12],
+      textStyle: {{ color: '#fff', fontSize: 12 }}
+    }};
 
     const keywordChart = echarts.init(document.getElementById('keywords'));
     keywordChart.setOption({{
       animationDuration: 700,
       grid: {{ left: 48, right: 22, top: 16, bottom: 74 }},
-      tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
+      tooltip: {{ ...tooltipTheme, trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
       xAxis: {{
         type: 'category',
         data: topKeywords.map(item => item.word),
@@ -936,17 +1172,22 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       series: [{{
         type: 'bar',
         data: topKeywords.map(item => item.count),
-        itemStyle: {{ color: '#c96d3a' }},
+        itemStyle: {{
+          color: '#c96d3a',
+          borderRadius: [10, 10, 0, 0],
+          shadowBlur: 14,
+          shadowColor: 'rgba(201, 109, 58, 0.18)'
+        }},
+        emphasis: {{ focus: 'series' }},
         barMaxWidth: 28
       }}]
     }});
 
-    const bucketOrder = ['0.0-0.2', '0.2-0.4', '0.4-0.6', '0.6-0.8', '0.8-1.0', 'unknown'];
     const sentimentChart = echarts.init(document.getElementById('sentiment'));
     sentimentChart.setOption({{
       animationDuration: 700,
       grid: {{ left: 42, right: 18, top: 16, bottom: 42 }},
-      tooltip: {{ trigger: 'axis' }},
+      tooltip: {{ ...tooltipTheme, trigger: 'axis' }},
       xAxis: {{
         type: 'category',
         data: bucketOrder,
@@ -965,7 +1206,9 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         data: bucketOrder.map(name => sentimentBuckets[name] || 0),
         lineStyle: {{ color: '#287271', width: 3 }},
         areaStyle: {{ color: 'rgba(40, 114, 113, 0.18)' }},
-        itemStyle: {{ color: '#287271' }}
+        itemStyle: {{ color: '#287271' }},
+        symbol: 'circle',
+        symbolSize: 8
       }}]
     }});
 
@@ -973,7 +1216,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     timelineChart.setOption({{
       animationDuration: 700,
       grid: {{ left: 48, right: 18, top: 16, bottom: 74 }},
-      tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
+      tooltip: {{ ...tooltipTheme, trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
       xAxis: {{
         type: 'category',
         data: timeline.map(item => item.date),
@@ -989,7 +1232,12 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       series: [{{
         type: 'bar',
         data: timeline.map(item => item.count),
-        itemStyle: {{ color: '#4c7aaf' }},
+        itemStyle: {{
+          color: '#4c7aaf',
+          borderRadius: [10, 10, 0, 0],
+          shadowBlur: 16,
+          shadowColor: 'rgba(76, 122, 175, 0.18)'
+        }},
         barMaxWidth: 26
       }}]
     }});
@@ -999,6 +1247,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       animationDuration: 700,
       grid: {{ left: 54, right: 28, top: 20, bottom: 72 }},
       tooltip: {{
+        ...tooltipTheme,
         formatter: params => {{
           const data = params.data;
           const title = data[3] || '未命名回答';
@@ -1026,11 +1275,17 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         orient: 'horizontal',
         left: 'center',
         bottom: 0,
+        textStyle: {{ color: axisLabelColor }},
         inRange: {{ color: ['#6b1d1d', '#d6c65b', '#276749'] }}
       }},
       series: [{{
         type: 'scatter',
-        symbolSize: value => Math.max(10, Math.sqrt(value[1] + 1) * 3),
+        symbolSize: value => Math.min(52, Math.max(10, Math.sqrt(value[1] + 1) * 3)),
+        itemStyle: {{
+          borderColor: 'rgba(255, 255, 255, 0.9)',
+          borderWidth: 1,
+          opacity: 0.9
+        }},
         data: scatterPoints
       }}]
     }});

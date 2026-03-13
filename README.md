@@ -26,6 +26,12 @@ This repo can be used in two ways:
   - `raw/entries/*/index.md`
   - `raw/zhihu.db`
 
+## Preview
+
+Sample dashboard render generated from the bundled report script:
+
+![Dashboard preview](./assets/dashboard-preview.png)
+
 ## Requirements
 
 - Python 3.10+
