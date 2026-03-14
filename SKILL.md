@@ -77,6 +77,9 @@ Useful flags:
 - `--no-images`: skip image downloads during fetch mode to speed up long runs.
 - `--stopwords FILE`: merge custom stopwords with the bundled list.
 - `--font-path FILE`: override the Chinese font used for the word cloud.
+- `--lda-topics N`: number of LDA topics (set to 0 to disable).
+- `--lda-words N`: top words per LDA topic.
+- `--lda-max-iter N`: LDA training iterations.
 
 ## Decision Notes
 
@@ -100,6 +103,9 @@ Use this default report structure unless the user asks for something more specif
 
 ## 词云与高频词
 [embedded word cloud image + top keywords table]
+
+## 主题聚类 (LDA)
+[topic clusters with top words and coverage share]
 
 ## ECharts 可视化
 [embedded iframe that renders the local ECharts dashboard directly inside the Markdown report]

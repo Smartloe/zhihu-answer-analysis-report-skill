@@ -108,10 +108,28 @@ def parse_args() -> argparse.Namespace:
         "--font-path",
         help="Override the font used by the word cloud.",
     )
+    parser.add_argument(
+        "--lda-topics",
+        type=int,
+        default=6,
+        help="Number of LDA topics to infer. Use 0 to disable LDA.",
+    )
+    parser.add_argument(
+        "--lda-words",
+        type=int,
+        default=8,
+        help="Top words to keep per LDA topic.",
+    )
+    parser.add_argument(
+        "--lda-max-iter",
+        type=int,
+        default=15,
+        help="Max iterations for the LDA optimizer.",
+    )
     return parser.parse_args()
 
 
-def load_analysis_dependencies() -> tuple[Any, Any, Any]:
+def load_analysis_dependencies() -> tuple[Any, Any, Any, Any, Any]:
     missing: list[str] = []
     try:
         import jieba
@@ -131,6 +149,14 @@ def load_analysis_dependencies() -> tuple[Any, Any, Any]:
         WordCloud = None
         missing.append("wordcloud")
 
+    try:
+        from sklearn.decomposition import LatentDirichletAllocation
+        from sklearn.feature_extraction.text import CountVectorizer
+    except ImportError:
+        LatentDirichletAllocation = None
+        CountVectorizer = None
+        missing.append("scikit-learn")
+
     if missing:
         raise SystemExit(
             "Missing analysis dependencies: "
@@ -138,7 +164,7 @@ def load_analysis_dependencies() -> tuple[Any, Any, Any]:
             f"Install them with:\npython3 -m pip install {' '.join(missing)}"
         )
 
-    return jieba, SnowNLP, WordCloud
+    return jieba, SnowNLP, WordCloud, LatentDirichletAllocation, CountVectorizer
 
 
 def prepare_source(source: str) -> PreparedSource:
@@ -425,6 +451,29 @@ def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
+def tokenize_text(
+    text: str,
+    jieba: Any,
+    stopwords: set[str],
+    min_word_length: int,
+) -> list[str]:
+    tokens: list[str] = []
+    for token in jieba.cut(text, cut_all=False):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if len(token) < min_word_length:
+            continue
+        if token in stopwords:
+            continue
+        if re.fullmatch(r"[_\W]+", token):
+            continue
+        if token.isdigit():
+            continue
+        tokens.append(token)
+    return tokens
+
+
 def tokenize_records(
     records: list[dict[str, Any]],
     jieba: Any,
@@ -434,26 +483,99 @@ def tokenize_records(
     frequencies: Counter = Counter()
     for record in records:
         text = record.get("text", "").strip()
-        tokens: list[str] = []
-        for token in jieba.cut(text, cut_all=False):
-            token = token.strip().lower()
-            if not token:
-                continue
-            if len(token) < min_word_length:
-                continue
-            if token in stopwords:
-                continue
-            if re.fullmatch(r"[_\W]+", token):
-                continue
-            if token.isdigit():
-                continue
-            tokens.append(token)
-
+        tokens = tokenize_text(text, jieba, stopwords, min_word_length)
         record["char_count"] = len(text)
         record["token_count"] = len(tokens)
         frequencies.update(tokens)
 
     return frequencies
+
+
+def run_lda_topics(
+    records: list[dict[str, Any]],
+    jieba: Any,
+    stopwords: set[str],
+    min_word_length: int,
+    topic_count: int,
+    top_words: int,
+    max_iter: int,
+    LDA: Any,
+    CountVectorizer: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    if topic_count <= 0:
+        return [], [], "LDA disabled"
+
+    docs: list[list[str]] = []
+    doc_indices: list[int] = []
+    for idx, record in enumerate(records):
+        tokens = tokenize_text(record.get("text", ""), jieba, stopwords, min_word_length)
+        if tokens:
+            docs.append(tokens)
+            doc_indices.append(idx)
+
+    if len(docs) < max(8, topic_count * 2):
+        return [], [], "Insufficient documents for LDA"
+
+    min_df = 2 if len(docs) >= 20 else 1
+    vectorizer = CountVectorizer(
+        tokenizer=lambda tokens: tokens,
+        preprocessor=lambda tokens: tokens,
+        token_pattern=None,
+        min_df=min_df,
+        max_df=0.95,
+    )
+    doc_term = vectorizer.fit_transform(docs)
+    if doc_term.shape[1] < 6:
+        return [], [], "Insufficient vocabulary for LDA"
+
+    max_topics = min(topic_count, doc_term.shape[0], doc_term.shape[1])
+    if max_topics < 2:
+        return [], [], "Insufficient data for LDA"
+    if max_topics != topic_count:
+        topic_count = max_topics
+
+    lda = LDA(
+        n_components=topic_count,
+        max_iter=max_iter,
+        learning_method="batch",
+        random_state=42,
+    )
+    doc_topics = lda.fit_transform(doc_term)
+    topic_assignments = doc_topics.argmax(axis=1)
+    topic_scores = doc_topics.max(axis=1)
+
+    for index, topic_id, score in zip(doc_indices, topic_assignments, topic_scores):
+        records[index]["topic_id"] = int(topic_id) + 1
+        records[index]["topic_score"] = round(float(score), 4)
+
+    feature_names = vectorizer.get_feature_names_out()
+    topic_counts = Counter(int(topic_id) for topic_id in topic_assignments)
+    topic_summaries: list[dict[str, Any]] = []
+    topic_distribution: list[dict[str, Any]] = []
+    total_docs = sum(topic_counts.values()) or 1
+
+    for idx in range(topic_count):
+        top_idx = lda.components_[idx].argsort()[::-1][:top_words]
+        words = [feature_names[word_idx] for word_idx in top_idx]
+        count = topic_counts.get(idx, 0)
+        share = round(count / total_docs, 4)
+        topic_summaries.append(
+            {
+                "topic_id": idx + 1,
+                "top_words": words,
+                "doc_count": count,
+                "doc_share": share,
+            }
+        )
+        topic_distribution.append(
+            {
+                "topic": f"Topic {idx + 1}",
+                "count": count,
+                "keywords": " ".join(words[:3]),
+            }
+        )
+
+    return topic_summaries, topic_distribution, None
 
 
 def score_sentiment(records: list[dict[str, Any]], SnowNLP: Any) -> None:
@@ -498,6 +620,9 @@ def build_summary(
     frequencies: Counter,
     prepared: PreparedSource,
     top_k: int,
+    lda_topics: list[dict[str, Any]] | None = None,
+    lda_distribution: list[dict[str, Any]] | None = None,
+    lda_note: str | None = None,
 ) -> dict[str, Any]:
     sentiments = [record["sentiment"] for record in records if record.get("sentiment") is not None]
     char_counts = [record.get("char_count", 0) for record in records]
@@ -541,6 +666,9 @@ def build_summary(
             {"word": word, "count": count}
             for word, count in frequencies.most_common(top_k)
         ],
+        "lda_topics": lda_topics or [],
+        "lda_topic_distribution": lda_distribution or [],
+        "lda_note": lda_note,
         "top_authors": [
             {"author": author, "count": count}
             for author, count in authors.most_common(10)
@@ -601,6 +729,8 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     top_keywords = summary["top_keywords"][:20]
     timeline = summary["timeline"]
     sentiment_buckets = summary["sentiment_buckets"]
+    lda_topics = summary.get("lda_topics") or []
+    lda_distribution = summary.get("lda_topic_distribution") or []
     sentiment_labels = summary.get("sentiment_labels", {})
     question_title = summary.get("question_title") or "知乎回答分析"
     average_sentiment = summary.get("average_sentiment")
@@ -628,6 +758,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     dominant_bucket_count = sentiment_buckets.get(dominant_bucket, 0)
     timeline_peak = max(timeline, key=lambda item: item.get("count", 0), default={"date": "N/A", "count": 0})
     timeline_peak_label = f"{timeline_peak.get('date', 'N/A')} / {timeline_peak.get('count', 0)} 条"
+    lda_topic_count = len(lda_topics)
 
     scatter_points = []
     for record in records:
@@ -642,6 +773,24 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
             ]
         )
     scatter_count = len(scatter_points)
+
+    topics_panel_html = ""
+    if lda_topics:
+        topics_panel_html = f"""
+      <article class="panel panel-full panel-topic">
+        <div class="panel-head">
+          <div class="panel-topline">
+            <div>
+              <span class="panel-tag">Topic Clusters</span>
+              <h2>LDA 主题聚类</h2>
+            </div>
+            <span class="panel-metric">主题数: {lda_topic_count}</span>
+          </div>
+          <p class="panel-desc">基于 LDA 的主题聚类与话题占比概览。</p>
+        </div>
+        <div id="topics" class="chart chart-md"></div>
+      </article>
+"""
 
     html = f"""<!doctype html>
 <html lang="zh-CN">
@@ -910,11 +1059,17 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     .panel-map {{
       background: linear-gradient(180deg, rgba(107, 29, 29, 0.08), rgba(255, 253, 249, 0.98) 34%);
     }}
+    .panel-topic {{
+      background: linear-gradient(180deg, rgba(40, 114, 113, 0.08), rgba(255, 253, 249, 0.98) 34%);
+    }}
     .panel-wide {{
       grid-column: span 7;
     }}
     .panel-narrow {{
       grid-column: span 5;
+    }}
+    .panel-full {{
+      grid-column: span 12;
     }}
     .panel-head {{
       display: flex;
@@ -1135,6 +1290,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         </div>
         <div id="scatter" class="chart chart-md"></div>
       </article>
+{topics_panel_html}
     </section>
   </main>
   <script>
@@ -1142,6 +1298,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     const sentimentBuckets = {json.dumps(sentiment_buckets, ensure_ascii=False)};
     const timeline = {json.dumps(timeline, ensure_ascii=False)};
     const scatterPoints = {json.dumps(scatter_points, ensure_ascii=False)};
+    const ldaDistribution = {json.dumps(lda_distribution, ensure_ascii=False)};
     const bucketOrder = {json.dumps(bucket_order, ensure_ascii=False)};
     const axisLabelColor = '#615949';
     const splitLineColor = 'rgba(109, 94, 72, 0.16)';
@@ -1291,6 +1448,46 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     }});
 
     const charts = [keywordChart, sentimentChart, timelineChart, scatterChart];
+    const topicEl = document.getElementById('topics');
+    if (topicEl && ldaDistribution.length) {{
+      const topicChart = echarts.init(topicEl);
+      topicChart.setOption({{
+        animationDuration: 700,
+        grid: {{ left: 52, right: 24, top: 16, bottom: 56 }},
+        tooltip: {{
+          ...tooltipTheme,
+          formatter: params => {{
+            const data = params.data;
+            const keywords = data[2] ? `<br>关键词: ${{data[2]}}` : '';
+            return `${{data[0]}}<br>回答数: ${{data[1]}}${{keywords}}`;
+          }}
+        }},
+        xAxis: {{
+          type: 'category',
+          data: ldaDistribution.map(item => item.topic),
+          axisLabel: {{ color: axisLabelColor }},
+          axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
+          axisTick: {{ show: false }}
+        }},
+        yAxis: {{
+          type: 'value',
+          axisLabel: {{ color: axisLabelColor }},
+          splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
+        }},
+        series: [{{
+          type: 'bar',
+          data: ldaDistribution.map(item => [item.topic, item.count, item.keywords]),
+          itemStyle: {{
+            color: '#287271',
+            borderRadius: [10, 10, 0, 0],
+            shadowBlur: 14,
+            shadowColor: 'rgba(40, 114, 113, 0.18)'
+          }},
+          barMaxWidth: 32
+        }}]
+      }});
+      charts.push(topicChart);
+    }}
     const syncFrameHeight = () => {{
       const frame = window.frameElement;
       if (!frame) {{
@@ -1402,6 +1599,30 @@ def write_report(
     lines.extend(
         [
             "",
+            "## 主题聚类 (LDA)",
+            "",
+        ]
+    )
+
+    if summary.get("lda_topics"):
+        lines.extend(
+            [
+                "| 主题 | 关键词 | 覆盖回答数 | 占比 |",
+                "|---|---|---|---|",
+            ]
+        )
+        for topic in summary["lda_topics"]:
+            words = "、".join(topic.get("top_words", []))
+            lines.append(
+                f"| Topic {topic['topic_id']} | {words} | {topic.get('doc_count', 0)} | {topic.get('doc_share', 0)} |"
+            )
+    else:
+        note = summary.get("lda_note") or "未启用 LDA 或数据不足，未生成主题聚类结果。"
+        lines.append(note)
+
+    lines.extend(
+        [
+            "",
             "## 情感分析",
             "",
             "情感分使用 SnowNLP 生成，范围接近 0 到 1。分值越接近 1，文本越偏正向；越接近 0，文本越偏负向。",
@@ -1421,7 +1642,7 @@ def write_report(
             "",
             "<div style=\"margin: 16px 0 24px;\">",
             f"<iframe src=\"{dashboard_rel}\" title=\"ECharts Dashboard\" "
-            "style=\"width: 100%; min-height: 1720px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
+            "style=\"width: 100%; min-height: 1960px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
             "loading=\"lazy\"></iframe>",
             "</div>",
             "",
@@ -1512,7 +1733,7 @@ async def main() -> None:
 
     output_dir = resolve_output_dir(prepared, args.output_dir)
 
-    jieba, SnowNLP, WordCloud = load_analysis_dependencies()
+    jieba, SnowNLP, WordCloud, LDA, CountVectorizer = load_analysis_dependencies()
     stopwords = load_stopwords(args.stopwords)
     font_path = resolve_wordcloud_font(args.font_path)
 
@@ -1534,7 +1755,26 @@ async def main() -> None:
 
     frequencies = tokenize_records(records, jieba, stopwords, args.min_word_length)
     score_sentiment(records, SnowNLP)
-    summary = build_summary(records, frequencies, prepared, args.top_k)
+    lda_topics, lda_distribution, lda_note = run_lda_topics(
+        records=records,
+        jieba=jieba,
+        stopwords=stopwords,
+        min_word_length=args.min_word_length,
+        topic_count=args.lda_topics,
+        top_words=args.lda_words,
+        max_iter=args.lda_max_iter,
+        LDA=LDA,
+        CountVectorizer=CountVectorizer,
+    )
+    summary = build_summary(
+        records,
+        frequencies,
+        prepared,
+        args.top_k,
+        lda_topics=lda_topics,
+        lda_distribution=lda_distribution,
+        lda_note=lda_note,
+    )
     write_outputs(output_dir, summary, records, frequencies, WordCloud, font_path)
 
     print(f"Report bundle created at: {output_dir}")

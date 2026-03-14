@@ -5,6 +5,7 @@ A standalone repository for crawling Zhihu question answers and turning them int
 - `jieba` keyword segmentation
 - word cloud generation
 - `SnowNLP` sentiment analysis
+- LDA topic clustering
 - ECharts visualizations embedded directly in `report.md`
 
 This repo can be used in two ways:
@@ -96,6 +97,9 @@ python3 scripts/zhihu_answer_report.py \
 - `--stopwords FILE`: extend the bundled stopword list
 - `--font-path FILE`: override the word cloud font
 - `--top-k N`: control the top keyword count
+- `--lda-topics N`: number of LDA topics (set to 0 to disable)
+- `--lda-words N`: top words per LDA topic
+- `--lda-max-iter N`: LDA training iterations
 
 ## Output Layout
 
