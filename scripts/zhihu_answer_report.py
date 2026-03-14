@@ -774,6 +774,31 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         )
     scatter_count = len(scatter_points)
 
+    topic_cards_html = ""
+    if lda_topics:
+        topic_cards = []
+        for topic in lda_topics:
+            topic_id = topic.get("topic_id", "")
+            words = topic.get("top_words") or []
+            keywords = " / ".join(words[:6]) if words else "未提取关键词"
+            count = topic.get("doc_count", 0)
+            share = topic.get("doc_share", 0)
+            share_display = f"{share * 100:.1f}%"
+            topic_cards.append(
+                f"""
+          <div class=\"topic-card\">
+            <div class=\"topic-title\">主题 {topic_id}</div>
+            <div class=\"topic-words\">{keywords}</div>
+            <div class=\"topic-meta\">回答 {count} · 占比 {share_display}</div>
+          </div>
+"""
+            )
+        topic_cards_html = f"""
+        <div class=\"topic-grid\">
+{"".join(topic_cards)}
+        </div>
+"""
+
     topics_panel_html = ""
     if lda_topics:
         topics_panel_html = f"""
@@ -789,6 +814,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
           <p class="panel-desc">基于 LDA 的主题聚类与话题占比概览。</p>
         </div>
         <div id="topics" class="chart chart-md"></div>
+{topic_cards_html}
       </article>
 """
 
@@ -1102,6 +1128,40 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       font-weight: 700;
       white-space: nowrap;
     }}
+    .panel-topic .chart {{
+      margin-bottom: 14px;
+    }}
+    .topic-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }}
+    .topic-card {{
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(120, 95, 61, 0.12);
+      box-shadow: 0 12px 24px rgba(67, 46, 22, 0.06);
+    }}
+    .topic-title {{
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }}
+    .topic-words {{
+      margin-top: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--ink);
+      line-height: 1.45;
+    }}
+    .topic-meta {{
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }}
     .chart {{
       width: 100%;
       min-width: 0;
@@ -1110,7 +1170,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       height: 420px;
     }}
     .chart-md {{
-      height: 360px;
+      height: 380px;
     }}
     @media (max-width: 1180px) {{
       .stats {{
@@ -1402,7 +1462,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     const scatterChart = echarts.init(document.getElementById('scatter'));
     scatterChart.setOption({{
       animationDuration: 700,
-      grid: {{ left: 64, right: 42, top: 24, bottom: 96, containLabel: true }},
+      grid: {{ left: 76, right: 56, top: 28, bottom: 120, containLabel: true }},
       tooltip: {{
         ...tooltipTheme,
         formatter: params => {{
@@ -1414,17 +1474,19 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       xAxis: {{
         type: 'value',
         name: '字数',
-        nameTextStyle: {{ color: axisLabelColor }},
-        axisLabel: {{ color: axisLabelColor, margin: 10 }},
-        nameGap: 18,
+        nameLocation: 'middle',
+        nameTextStyle: {{ color: axisLabelColor, fontSize: 12 }},
+        axisLabel: {{ color: axisLabelColor, margin: 12, fontSize: 11 }},
+        nameGap: 32,
         splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
       }},
       yAxis: {{
         type: 'value',
         name: '赞同数',
-        nameTextStyle: {{ color: axisLabelColor }},
-        axisLabel: {{ color: axisLabelColor, margin: 12 }},
-        nameGap: 22,
+        nameLocation: 'middle',
+        nameTextStyle: {{ color: axisLabelColor, fontSize: 12 }},
+        axisLabel: {{ color: axisLabelColor, margin: 12, fontSize: 11 }},
+        nameGap: 46,
         splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
       }},
       visualMap: {{
@@ -1433,10 +1495,11 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         dimension: 2,
         orient: 'horizontal',
         left: 'center',
-        bottom: 18,
+        bottom: 14,
         textStyle: {{ color: axisLabelColor, fontSize: 11 }},
-        itemWidth: 18,
-        itemHeight: 120,
+        itemWidth: 14,
+        itemHeight: 90,
+        textGap: 6,
         inRange: {{ color: ['#6b1d1d', '#d6c65b', '#276749'] }}
       }},
       series: [{{
@@ -1457,7 +1520,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       const topicChart = echarts.init(topicEl);
       topicChart.setOption({{
         animationDuration: 700,
-        grid: {{ left: 64, right: 32, top: 20, bottom: 96, containLabel: true }},
+        grid: {{ left: 72, right: 26, top: 28, bottom: 110, containLabel: true }},
         tooltip: {{
           ...tooltipTheme,
           formatter: params => {{
@@ -1469,15 +1532,15 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         xAxis: {{
           type: 'category',
           data: ldaDistribution.map(item => item.topic),
-          axisLabel: {{ color: axisLabelColor, rotate: 12, margin: 10 }},
+          axisLabel: {{ color: axisLabelColor, rotate: 18, margin: 12, fontSize: 11 }},
           axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
           axisTick: {{ show: false }}
         }},
         yAxis: {{
           type: 'value',
           name: '回答数',
-          nameGap: 26,
-          axisLabel: {{ color: axisLabelColor, margin: 10 }},
+          nameGap: 30,
+          axisLabel: {{ color: axisLabelColor, margin: 10, fontSize: 11 }},
           splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
         }},
         series: [{{
@@ -1494,7 +1557,12 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
             show: true,
             position: 'top',
             color: axisLabelColor,
-            formatter: params => params.data[2] || ''
+            fontSize: 11,
+            lineHeight: 14,
+            formatter: params => {{
+              const keywords = params.data[2] || '';
+              return keywords ? keywords.split(/\\s+/).join(' · ') : '';
+            }}
           }},
           labelLayout: {{
             hideOverlap: true,
