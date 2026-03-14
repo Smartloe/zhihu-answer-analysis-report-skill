@@ -1402,7 +1402,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     const scatterChart = echarts.init(document.getElementById('scatter'));
     scatterChart.setOption({{
       animationDuration: 700,
-      grid: {{ left: 54, right: 28, top: 20, bottom: 72 }},
+      grid: {{ left: 64, right: 42, top: 24, bottom: 96, containLabel: true }},
       tooltip: {{
         ...tooltipTheme,
         formatter: params => {{
@@ -1415,14 +1415,16 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         type: 'value',
         name: '字数',
         nameTextStyle: {{ color: axisLabelColor }},
-        axisLabel: {{ color: axisLabelColor }},
+        axisLabel: {{ color: axisLabelColor, margin: 10 }},
+        nameGap: 18,
         splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
       }},
       yAxis: {{
         type: 'value',
         name: '赞同数',
         nameTextStyle: {{ color: axisLabelColor }},
-        axisLabel: {{ color: axisLabelColor }},
+        axisLabel: {{ color: axisLabelColor, margin: 12 }},
+        nameGap: 22,
         splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
       }},
       visualMap: {{
@@ -1431,8 +1433,10 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         dimension: 2,
         orient: 'horizontal',
         left: 'center',
-        bottom: 0,
-        textStyle: {{ color: axisLabelColor }},
+        bottom: 18,
+        textStyle: {{ color: axisLabelColor, fontSize: 11 }},
+        itemWidth: 18,
+        itemHeight: 120,
         inRange: {{ color: ['#6b1d1d', '#d6c65b', '#276749'] }}
       }},
       series: [{{
@@ -1453,7 +1457,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       const topicChart = echarts.init(topicEl);
       topicChart.setOption({{
         animationDuration: 700,
-        grid: {{ left: 52, right: 24, top: 16, bottom: 56 }},
+        grid: {{ left: 64, right: 32, top: 20, bottom: 96, containLabel: true }},
         tooltip: {{
           ...tooltipTheme,
           formatter: params => {{
@@ -1465,13 +1469,15 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         xAxis: {{
           type: 'category',
           data: ldaDistribution.map(item => item.topic),
-          axisLabel: {{ color: axisLabelColor }},
+          axisLabel: {{ color: axisLabelColor, rotate: 12, margin: 10 }},
           axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
           axisTick: {{ show: false }}
         }},
         yAxis: {{
           type: 'value',
-          axisLabel: {{ color: axisLabelColor }},
+          name: '回答数',
+          nameGap: 26,
+          axisLabel: {{ color: axisLabelColor, margin: 10 }},
           splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
         }},
         series: [{{
@@ -1483,7 +1489,17 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
             shadowBlur: 14,
             shadowColor: 'rgba(40, 114, 113, 0.18)'
           }},
-          barMaxWidth: 32
+          barMaxWidth: 32,
+          label: {{
+            show: true,
+            position: 'top',
+            color: axisLabelColor,
+            formatter: params => params.data[2] || ''
+          }},
+          labelLayout: {{
+            hideOverlap: true,
+            moveOverlap: 'shiftY'
+          }}
         }}]
       }});
       charts.push(topicChart);
