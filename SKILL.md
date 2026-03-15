@@ -1,6 +1,6 @@
 ---
 name: zhihu-answer-analysis-report
-description: Standalone workflow that crawls every answer under a Zhihu question, then runs jieba tokenization, word cloud generation, SnowNLP sentiment analysis, and ECharts visualizations to produce a Markdown report. Use when asked to analyze a Zhihu question page, an answer URL that should be expanded to the full question, or an existing local scrape directory and deliver a report with charts and text insights.
+description: Standalone workflow that crawls every answer under a Zhihu question, then runs jieba tokenization, word cloud generation, SnowNLP sentiment analysis, LDA topic clustering, inferred author network analysis, and ECharts visualizations to produce a Markdown report. Use when asked to analyze a Zhihu question page, an answer URL that should be expanded to the full question, or an existing local scrape directory and deliver a report with charts and text insights.
 ---
 
 # Zhihu Answer Analysis Report
@@ -57,7 +57,7 @@ python3 scripts/zhihu_answer_report.py \
 4. Generate outputs.
    `report.md`: the final Markdown report.
    `analysis/wordcloud.png`: static word cloud image.
-   `analysis/dashboard.html`: responsive ECharts dashboard with a desktop two-column card layout and mobile single-column fallback.
+   `analysis/dashboard.html`: responsive ECharts dashboard with sentiment charts, LDA topic clustering, and an inferred author network graph.
    `analysis/summary.json`: structured metrics.
    `analysis/answers.jsonl`: row-level answer dataset for reuse.
    `raw/entries/*/index.md` and `raw/zhihu.db`: raw scrape artifacts when running from a URL.
@@ -80,6 +80,8 @@ Useful flags:
 - `--lda-topics N`: number of LDA topics (set to 0 to disable).
 - `--lda-words N`: top words per LDA topic.
 - `--lda-max-iter N`: LDA training iterations.
+- `--network-max-nodes N`: number of author nodes kept in the inferred author network (`0` disables it).
+- `--network-max-edges N`: number of edges kept in the inferred author network.
 
 ## Decision Notes
 
@@ -87,6 +89,7 @@ Useful flags:
 - If dependencies are missing, install them first rather than rewriting the analysis stack.
 - If the user already has local outputs, prefer path mode over re-scraping.
 - If the word cloud font cannot be resolved automatically, pass `--font-path` explicitly.
+- The author network should be described as an inferred association graph, not Zhihu's real follow or comment relationship graph.
 
 ## Report Contract
 
@@ -106,6 +109,9 @@ Use this default report structure unless the user asks for something more specif
 
 ## 主题聚类 (LDA)
 [topic clusters with top words and coverage share]
+
+## 作者关联网络
+[inferred author network based on topic and keyword overlap; clarify that it is not a real follow graph]
 
 ## ECharts 可视化
 [embedded iframe that renders the local ECharts dashboard directly inside the Markdown report]

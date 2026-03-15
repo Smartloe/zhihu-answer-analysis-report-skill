@@ -6,6 +6,7 @@ A standalone repository for crawling Zhihu question answers and turning them int
 - word cloud generation
 - `SnowNLP` sentiment analysis
 - LDA topic clustering
+- inferred author network graph
 - ECharts visualizations embedded directly in `report.md`
 
 This repo can be used in two ways:
@@ -100,6 +101,8 @@ python3 scripts/zhihu_answer_report.py \
 - `--lda-topics N`: number of LDA topics (set to 0 to disable)
 - `--lda-words N`: top words per LDA topic
 - `--lda-max-iter N`: LDA training iterations
+- `--network-max-nodes N`: cap author nodes in the inferred author network (`0` disables it)
+- `--network-max-edges N`: cap author links in the inferred author network
 
 ## Output Layout
 
@@ -137,6 +140,7 @@ After that, restart Codex and trigger it with prompts like:
 
 - Zhihu may report a higher answer total than the number of answers actually returned by paginated APIs.
 - The report embeds the ECharts dashboard via `iframe`, so the Markdown renderer must support inline HTML for the chart area to appear directly in the document.
+- The author network is an inferred similarity graph based on topic and keyword overlap, not Zhihu's real follow/comment relationship graph.
 - `cookies.json`, `cookie_pool/`, `data/`, logs, and SQLite files are ignored by Git.
 
 ## License

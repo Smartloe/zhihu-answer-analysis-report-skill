@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import statistics
@@ -125,6 +126,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=15,
         help="Max iterations for the LDA optimizer.",
+    )
+    parser.add_argument(
+        "--network-max-nodes",
+        type=int,
+        default=18,
+        help="Maximum number of author nodes kept in the inferred author network. Use 0 to disable it.",
+    )
+    parser.add_argument(
+        "--network-max-edges",
+        type=int,
+        default=28,
+        help="Maximum number of author links kept in the inferred author network.",
     )
     return parser.parse_args()
 
@@ -615,6 +628,197 @@ def sentiment_label(score: float | None) -> str:
     return "positive"
 
 
+def build_author_network(
+    records: list[dict[str, Any]],
+    jieba: Any,
+    stopwords: set[str],
+    min_word_length: int,
+    lda_topics: list[dict[str, Any]] | None,
+    max_nodes: int,
+    max_edges: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    if max_nodes <= 0 or max_edges <= 0:
+        return {"nodes": [], "links": [], "categories": []}, [], "Author network disabled"
+
+    topic_word_map = {
+        int(topic.get("topic_id")): list(topic.get("top_words") or [])
+        for topic in (lda_topics or [])
+        if topic.get("topic_id") is not None
+    }
+    author_profiles: dict[str, dict[str, Any]] = {}
+
+    for record in records:
+        author = (record.get("author") or "Unknown").strip() or "Unknown"
+        profile = author_profiles.setdefault(
+            author,
+            {
+                "author": author,
+                "answers": 0,
+                "upvotes": 0,
+                "char_total": 0,
+                "sentiments": [],
+                "topics": Counter(),
+                "keywords": Counter(),
+            },
+        )
+        profile["answers"] += 1
+        profile["upvotes"] += int(record.get("upvotes") or 0)
+        profile["char_total"] += int(record.get("char_count") or 0)
+
+        sentiment = record.get("sentiment")
+        if sentiment is not None:
+            profile["sentiments"].append(float(sentiment))
+
+        topic_id = record.get("topic_id")
+        if topic_id is not None:
+            profile["topics"][int(topic_id)] += 1
+
+        tokens = tokenize_text(record.get("text", ""), jieba, stopwords, min_word_length)
+        if tokens:
+            profile["keywords"].update(tokens)
+
+    if len(author_profiles) < 3:
+        return {"nodes": [], "links": [], "categories": []}, [], "Insufficient authors for author network"
+
+    ranked_profiles = sorted(
+        author_profiles.values(),
+        key=lambda item: (item["answers"], item["upvotes"], item["char_total"]),
+        reverse=True,
+    )[:max_nodes]
+
+    if len(ranked_profiles) < 3:
+        return {"nodes": [], "links": [], "categories": []}, [], "Insufficient authors for author network"
+
+    categories: list[dict[str, str]] = []
+    category_map: dict[str, int] = {}
+    max_answers = max((profile["answers"] for profile in ranked_profiles), default=1)
+
+    for profile in ranked_profiles:
+        dominant_topic_id = None
+        if profile["topics"]:
+            dominant_topic_id = int(profile["topics"].most_common(1)[0][0])
+        profile["dominant_topic_id"] = dominant_topic_id
+        top_keywords = [word for word, _ in profile["keywords"].most_common(12)]
+        profile["top_keywords"] = top_keywords
+        profile["keyword_set"] = set(top_keywords)
+        profile["avg_sentiment"] = (
+            round(sum(profile["sentiments"]) / len(profile["sentiments"]), 4)
+            if profile["sentiments"]
+            else None
+        )
+        topic_words = topic_word_map.get(dominant_topic_id, [])
+        profile["topic_keywords_display"] = " / ".join(topic_words[:3]) if topic_words else "未聚类"
+        profile["keywords_display"] = " / ".join(top_keywords[:5]) if top_keywords else "未提取关键词"
+
+        category_name = f"Topic {dominant_topic_id}" if dominant_topic_id else "未聚类"
+        if category_name not in category_map:
+            category_map[category_name] = len(categories)
+            categories.append({"name": category_name})
+        profile["category_index"] = category_map[category_name]
+
+        answer_ratio = profile["answers"] / max_answers if max_answers else 0
+        profile["symbol_size"] = round(18 + math.log1p(profile["upvotes"]) * 3.6 + answer_ratio * 10, 2)
+
+    links: list[dict[str, Any]] = []
+    for idx, source in enumerate(ranked_profiles):
+        for target in ranked_profiles[idx + 1:]:
+            shared_keywords = sorted(source["keyword_set"] & target["keyword_set"])
+            union_keywords = source["keyword_set"] | target["keyword_set"]
+            keyword_score = (len(shared_keywords) / len(union_keywords)) if union_keywords else 0.0
+            same_topic = (
+                source["dominant_topic_id"] is not None
+                and source["dominant_topic_id"] == target["dominant_topic_id"]
+            )
+            sentiment_bonus = 0.0
+            if source["avg_sentiment"] is not None and target["avg_sentiment"] is not None:
+                sentiment_gap = abs(source["avg_sentiment"] - target["avg_sentiment"])
+                sentiment_bonus = max(0.0, 0.08 - sentiment_gap * 0.08)
+
+            score = keyword_score + (0.12 if same_topic else 0.0) + sentiment_bonus
+            if score < 0.2:
+                continue
+            if not shared_keywords and not same_topic:
+                continue
+
+            topic_name = f"Topic {source['dominant_topic_id']}" if same_topic else ""
+            relation_parts: list[str] = []
+            if same_topic:
+                relation_parts.append(topic_name)
+            if shared_keywords:
+                relation_parts.append("共享关键词: " + " / ".join(shared_keywords[:4]))
+
+            links.append(
+                {
+                    "source": source["author"],
+                    "target": target["author"],
+                    "value": round(score, 4),
+                    "shared_keywords": " / ".join(shared_keywords[:4]),
+                    "topic": topic_name,
+                    "relation": "；".join(relation_parts) if relation_parts else "文本相似",
+                    "lineStyle": {
+                        "width": round(1.2 + score * 8, 2),
+                        "opacity": round(min(0.72, 0.22 + score), 2),
+                    },
+                }
+            )
+
+    links.sort(
+        key=lambda item: (
+            item["value"],
+            len(item.get("shared_keywords", "").split(" / ")) if item.get("shared_keywords") else 0,
+        ),
+        reverse=True,
+    )
+    links = links[:max_edges]
+
+    if not links:
+        return {"nodes": [], "links": [], "categories": []}, [], "Authors were found, but no strong inferred links were detected"
+
+    connected_authors = {
+        author
+        for link in links
+        for author in (link["source"], link["target"])
+    }
+    ranked_profiles = [profile for profile in ranked_profiles if profile["author"] in connected_authors]
+
+    nodes = []
+    for profile in ranked_profiles:
+        topic_name = f"Topic {profile['dominant_topic_id']}" if profile["dominant_topic_id"] else "未聚类"
+        sentiment_value = profile["avg_sentiment"] if profile["avg_sentiment"] is not None else "N/A"
+        nodes.append(
+            {
+                "id": profile["author"],
+                "name": profile["author"],
+                "category": profile["category_index"],
+                "symbolSize": profile["symbol_size"],
+                "value": profile["upvotes"],
+                "answers": profile["answers"],
+                "upvotes": profile["upvotes"],
+                "avg_sentiment": sentiment_value,
+                "topic": topic_name,
+                "topic_keywords": profile["topic_keywords_display"],
+                "keywords": profile["keywords_display"],
+            }
+        )
+
+    highlights = [
+        {
+            "source": link["source"],
+            "target": link["target"],
+            "score": link["value"],
+            "relation": link["relation"],
+            "shared_keywords": link["shared_keywords"] or "同主题",
+        }
+        for link in links[:6]
+    ]
+
+    note = (
+        "作者关系图基于回答主题、关键词重合度与情感接近度推断，"
+        "不代表知乎真实关注、评论或私下社交关系。"
+    )
+    return {"nodes": nodes, "links": links, "categories": categories}, highlights, note
+
+
 def build_summary(
     records: list[dict[str, Any]],
     frequencies: Counter,
@@ -623,6 +827,9 @@ def build_summary(
     lda_topics: list[dict[str, Any]] | None = None,
     lda_distribution: list[dict[str, Any]] | None = None,
     lda_note: str | None = None,
+    author_network: dict[str, Any] | None = None,
+    author_network_highlights: list[dict[str, Any]] | None = None,
+    author_network_note: str | None = None,
 ) -> dict[str, Any]:
     sentiments = [record["sentiment"] for record in records if record.get("sentiment") is not None]
     char_counts = [record.get("char_count", 0) for record in records]
@@ -669,6 +876,9 @@ def build_summary(
         "lda_topics": lda_topics or [],
         "lda_topic_distribution": lda_distribution or [],
         "lda_note": lda_note,
+        "author_network": author_network or {"nodes": [], "links": [], "categories": []},
+        "author_network_highlights": author_network_highlights or [],
+        "author_network_note": author_network_note,
         "top_authors": [
             {"author": author, "count": count}
             for author, count in authors.most_common(10)
@@ -731,6 +941,13 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     sentiment_buckets = summary["sentiment_buckets"]
     lda_topics = summary.get("lda_topics") or []
     lda_distribution = summary.get("lda_topic_distribution") or []
+    author_network = summary.get("author_network") or {}
+    network_nodes = author_network.get("nodes") or []
+    network_links = author_network.get("links") or []
+    network_highlights = summary.get("author_network_highlights") or []
+    network_note = summary.get("author_network_note") or (
+        "作者关系图基于回答内容相似度推断，不代表知乎真实社交关系。"
+    )
     sentiment_labels = summary.get("sentiment_labels", {})
     question_title = summary.get("question_title") or "知乎回答分析"
     average_sentiment = summary.get("average_sentiment")
@@ -759,6 +976,8 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     timeline_peak = max(timeline, key=lambda item: item.get("count", 0), default={"date": "N/A", "count": 0})
     timeline_peak_label = f"{timeline_peak.get('date', 'N/A')} / {timeline_peak.get('count', 0)} 条"
     lda_topic_count = len(lda_topics)
+    network_node_count = len(network_nodes)
+    network_edge_count = len(network_links)
 
     scatter_points = []
     for record in records:
@@ -815,6 +1034,45 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         </div>
         <div id="topics" class="chart chart-md"></div>
 {topic_cards_html}
+      </article>
+"""
+
+    network_cards_html = ""
+    if network_highlights:
+        cards = []
+        for link in network_highlights:
+            relation = link.get("relation") or "文本相似"
+            cards.append(
+                f"""
+          <div class=\"network-card\">
+            <div class=\"network-pair\">{link.get('source', 'Unknown')} ↔ {link.get('target', 'Unknown')}</div>
+            <div class=\"network-score\">关联强度 {link.get('score', 0)}</div>
+            <div class=\"network-reason\">{relation}</div>
+          </div>
+"""
+            )
+        network_cards_html = f"""
+        <div class=\"network-grid\">
+{"".join(cards)}
+        </div>
+"""
+
+    network_panel_html = ""
+    if network_nodes and network_links:
+        network_panel_html = f"""
+      <article class="panel panel-full panel-network">
+        <div class="panel-head">
+          <div class="panel-topline">
+            <div>
+              <span class="panel-tag">Author Network</span>
+              <h2>作者关联网络</h2>
+            </div>
+            <span class="panel-metric">节点 {network_node_count} · 连线 {network_edge_count}</span>
+          </div>
+          <p class="panel-desc">{network_note}</p>
+        </div>
+        <div id="author-network" class="chart chart-network"></div>
+{network_cards_html}
       </article>
 """
 
@@ -1088,6 +1346,9 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     .panel-topic {{
       background: linear-gradient(180deg, rgba(40, 114, 113, 0.08), rgba(255, 253, 249, 0.98) 34%);
     }}
+    .panel-network {{
+      background: linear-gradient(180deg, rgba(76, 122, 175, 0.08), rgba(255, 253, 249, 0.98) 34%);
+    }}
     .panel-wide {{
       grid-column: span 7;
     }}
@@ -1162,6 +1423,36 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       font-size: 12px;
       color: var(--muted);
     }}
+    .network-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }}
+    .network-card {{
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(120, 95, 61, 0.12);
+      box-shadow: 0 12px 24px rgba(67, 46, 22, 0.06);
+    }}
+    .network-pair {{
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--ink);
+      line-height: 1.4;
+    }}
+    .network-score {{
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700;
+    }}
+    .network-reason {{
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.55;
+    }}
     .chart {{
       width: 100%;
       min-width: 0;
@@ -1171,6 +1462,10 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     }}
     .chart-md {{
       height: 380px;
+    }}
+    .chart-network {{
+      height: 560px;
+      margin-bottom: 14px;
     }}
     @media (max-width: 1180px) {{
       .stats {{
@@ -1208,7 +1503,8 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         grid-column: auto;
       }}
       .chart-lg,
-      .chart-md {{
+      .chart-md,
+      .chart-network {{
         height: 320px;
       }}
       .panel-topline {{
@@ -1351,6 +1647,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         <div id="scatter" class="chart chart-md"></div>
       </article>
 {topics_panel_html}
+{network_panel_html}
     </section>
   </main>
   <script>
@@ -1359,6 +1656,7 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
     const timeline = {json.dumps(timeline, ensure_ascii=False)};
     const scatterPoints = {json.dumps(scatter_points, ensure_ascii=False)};
     const ldaDistribution = {json.dumps(lda_distribution, ensure_ascii=False)};
+    const authorNetwork = {json.dumps(author_network, ensure_ascii=False)};
     const bucketOrder = {json.dumps(bucket_order, ensure_ascii=False)};
     const axisLabelColor = '#615949';
     const splitLineColor = 'rgba(109, 94, 72, 0.16)';
@@ -1572,6 +1870,67 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
       }});
       charts.push(topicChart);
     }}
+    const networkEl = document.getElementById('author-network');
+    if (networkEl && authorNetwork.nodes && authorNetwork.nodes.length) {{
+      const networkChart = echarts.init(networkEl);
+      networkChart.setOption({{
+        animationDuration: 700,
+        color: ['#4c7aaf', '#287271', '#c96d3a', '#b08929', '#9b3d3d', '#6f5b8c'],
+        tooltip: {{
+          ...tooltipTheme,
+          formatter: params => {{
+            if (params.dataType === 'edge') {{
+              const data = params.data;
+              return `${{data.source}} ↔ ${{data.target}}<br>强度: ${{data.value}}<br>${{data.relation || '文本相似'}}`;
+            }}
+            const data = params.data;
+            return `${{data.name}}<br>回答数: ${{data.answers}}<br>总赞同: ${{data.upvotes}}<br>主主题: ${{data.topic}}<br>关键词: ${{data.keywords}}<br>平均情感: ${{data.avg_sentiment}}`;
+          }}
+        }},
+        legend: authorNetwork.categories.length > 1
+          ? [{{
+              top: 8,
+              left: 'center',
+              itemWidth: 10,
+              itemHeight: 10,
+              textStyle: {{ color: axisLabelColor, fontSize: 11 }},
+              data: authorNetwork.categories.map(item => item.name)
+            }}]
+          : [],
+        series: [{{
+          type: 'graph',
+          layout: 'force',
+          roam: true,
+          draggable: true,
+          data: authorNetwork.nodes,
+          links: authorNetwork.links,
+          categories: authorNetwork.categories,
+          edgeSymbol: ['none', 'none'],
+          label: {{
+            show: true,
+            position: 'right',
+            color: axisLabelColor,
+            fontSize: 11
+          }},
+          lineStyle: {{
+            color: 'source',
+            curveness: 0.16
+          }},
+          emphasis: {{
+            focus: 'adjacency',
+            lineStyle: {{
+              width: 4
+            }}
+          }},
+          force: {{
+            repulsion: 260,
+            gravity: 0.08,
+            edgeLength: [70, 180]
+          }}
+        }}]
+      }});
+      charts.push(networkChart);
+    }}
     const syncFrameHeight = () => {{
       const frame = window.frameElement;
       if (!frame) {{
@@ -1623,6 +1982,13 @@ def build_key_findings(summary: dict[str, Any]) -> list[str]:
     keywords = ", ".join(item["word"] for item in summary["top_keywords"][:8])
     if keywords:
         findings.append(f"最显著的高频词包括：{keywords}。")
+    network_highlights = summary.get("author_network_highlights") or []
+    if network_highlights:
+        top_link = network_highlights[0]
+        findings.append(
+            f"作者关联网络中，{top_link['source']} 与 {top_link['target']} 的相似度最高，"
+            f"线索为 {top_link['shared_keywords']}。"
+        )
     return findings
 
 
@@ -1707,6 +2073,43 @@ def write_report(
     lines.extend(
         [
             "",
+            "## 作者关联网络",
+            "",
+        ]
+    )
+
+    author_network_highlights = summary.get("author_network_highlights") or []
+    author_network_note = summary.get("author_network_note") or (
+        "作者关系图基于主题与关键词相似度推断，不代表知乎真实关注或互动关系。"
+    )
+    lines.append(author_network_note)
+
+    if author_network_highlights:
+        lines.extend(
+            [
+                "",
+                "| 作者 A | 作者 B | 关联强度 | 关联依据 |",
+                "|---|---|---|---|",
+            ]
+        )
+        for item in author_network_highlights:
+            relation = (item.get("relation") or "").replace("|", "\\|")
+            lines.append(
+                f"| {item.get('source', '').replace('|', '\\|')} | "
+                f"{item.get('target', '').replace('|', '\\|')} | "
+                f"{item.get('score', 0)} | {relation} |"
+            )
+    else:
+        lines.extend(
+            [
+                "",
+                "当前样本中未检测到足够强的作者关联边，暂不输出关系对。",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
             "## 情感分析",
             "",
             "情感分使用 SnowNLP 生成，范围接近 0 到 1。分值越接近 1，文本越偏正向；越接近 0，文本越偏负向。",
@@ -1726,7 +2129,7 @@ def write_report(
             "",
             "<div style=\"margin: 16px 0 24px;\">",
             f"<iframe src=\"{dashboard_rel}\" title=\"ECharts Dashboard\" "
-            "style=\"width: 100%; min-height: 1960px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
+            "style=\"width: 100%; min-height: 2580px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
             "loading=\"lazy\"></iframe>",
             "</div>",
             "",
@@ -1850,6 +2253,15 @@ async def main() -> None:
         LDA=LDA,
         CountVectorizer=CountVectorizer,
     )
+    author_network, author_network_highlights, author_network_note = build_author_network(
+        records=records,
+        jieba=jieba,
+        stopwords=stopwords,
+        min_word_length=args.min_word_length,
+        lda_topics=lda_topics,
+        max_nodes=args.network_max_nodes,
+        max_edges=args.network_max_edges,
+    )
     summary = build_summary(
         records,
         frequencies,
@@ -1858,6 +2270,9 @@ async def main() -> None:
         lda_topics=lda_topics,
         lda_distribution=lda_distribution,
         lda_note=lda_note,
+        author_network=author_network,
+        author_network_highlights=author_network_highlights,
+        author_network_note=author_network_note,
     )
     write_outputs(output_dir, summary, records, frequencies, WordCloud, font_path)
 
