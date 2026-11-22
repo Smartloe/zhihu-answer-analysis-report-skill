@@ -214,7 +214,7 @@ def test_extract_text_from_markdown_strips_header_and_markup(report_module):
 def test_load_records_from_raw_markdown_directory(report_module, sample_raw):
     records = report_module.load_records_from_path(sample_raw)
 
-    assert len(records) == 30
+    assert len(records) == len(list(sample_raw.rglob("index.md")))
     first = records[0]
     assert {
         "id",
@@ -235,8 +235,11 @@ def test_load_records_from_raw_markdown_directory(report_module, sample_raw):
 
 def test_load_records_from_answers_jsonl_file(report_module, sample_jsonl):
     records = report_module.load_records_from_path(sample_jsonl)
+    expected = len(
+        [line for line in sample_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    )
 
-    assert len(records) == 30
+    assert len(records) == expected
     assert all("text" in record for record in records)
     assert all("markdown_path" in record for record in records)
 
@@ -370,11 +373,13 @@ def test_path_mode_generates_all_artifacts(path_bundle):
     )
 
 
-def test_path_mode_summary_reports_sample_dataset(path_bundle):
+def test_path_mode_summary_reports_sample_dataset(path_bundle, sample_raw):
     summary = _load_summary(path_bundle)
+    expected_answers = len(list(sample_raw.rglob("index.md")))
 
-    assert summary["answer_count"] == 30
-    assert summary["author_count"] == 30
+    assert summary["answer_count"] == expected_answers
+    assert summary["author_count"] > 0
+    assert summary["author_count"] <= expected_answers
     assert summary["question_title"]
     assert summary["source"].endswith("raw")
     assert summary["question_url"] is None
@@ -402,16 +407,22 @@ def test_path_mode_answers_jsonl_matches_summary(path_bundle):
     assert all("token_count" in record for record in records)
 
 
-def test_answers_jsonl_input_mode_generates_all_artifacts(jsonl_bundle):
+def test_answers_jsonl_input_mode_generates_all_artifacts(jsonl_bundle, sample_jsonl):
     for relative in EXPECTED_ARTIFACTS:
         artifact = jsonl_bundle / relative
         assert artifact.is_file(), f"missing artifact: {relative}"
         assert artifact.stat().st_size > 0, f"empty artifact: {relative}"
 
     summary = _load_summary(jsonl_bundle)
-    assert summary["answer_count"] == 30
-    assert summary["source"].endswith("answers.jsonl")
-    assert summary["question_title"] == "怎么看待央视在ins上对樊振东留德的定调？"
+    first_record = json.loads(
+        next(line for line in sample_jsonl.read_text(encoding="utf-8").splitlines() if line.strip())
+    )
+    expected = len(
+        [line for line in sample_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    )
+    assert summary["answer_count"] == expected
+    assert summary["source"].endswith(".jsonl")
+    assert summary["question_title"] == first_record["title"]
 
 
 REQUIRED_SUMMARY_KEYS = {

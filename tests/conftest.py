@@ -19,8 +19,18 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "zhihu_answer_report.py"
 SAMPLE_ROOT = REPO_ROOT / "data" / "reports" / "standalone-smoke-test"
-SAMPLE_RAW = SAMPLE_ROOT / "raw"
-SAMPLE_JSONL = SAMPLE_ROOT / "analysis" / "answers.jsonl"
+FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
+
+
+def _prefer_live_sample(live: Path, fallback: Path) -> Path:
+    """Use the local scrape when present, otherwise the committed synthetic fixture."""
+    return live if live.exists() else fallback
+
+
+SAMPLE_RAW = _prefer_live_sample(SAMPLE_ROOT / "raw", FIXTURE_ROOT / "sample_raw")
+SAMPLE_JSONL = _prefer_live_sample(
+    SAMPLE_ROOT / "analysis" / "answers.jsonl", FIXTURE_ROOT / "answers.jsonl"
+)
 
 
 def pytest_configure(config: pytest.Config) -> None:
