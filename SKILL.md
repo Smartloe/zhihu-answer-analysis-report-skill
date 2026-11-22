@@ -5,7 +5,7 @@ description: Standalone workflow that crawls every answer under a Zhihu question
 
 # Zhihu Answer Analysis Report
 
-Use this skill when the user wants a report, not just raw scraping output. This repository is self-contained and assumes the working directory is the repo root.
+Use this skill when the user wants a report, not just raw scraping output. The script resolves its own `core/` package from `__file__`; relative source/output arguments are resolved against the current working directory.
 
 ## Quick Start
 
@@ -19,7 +19,9 @@ python3 -m pip install -r requirements.txt
 
 Installing the project itself is optional when you run the bundled script from the repo root; it adds `core/` to `sys.path` automatically.
 
-2. Run the bundled script.
+2. For live crawling, make sure `cookies.json` contains a real `z_c0` (plus `d_c0`). A missing or expired cookie produces a `403`; export a fresh one from a logged-in browser. `cookie_pool/**/*.json` is also supported.
+
+3. Run the bundled script.
 
 For a Zhihu question URL:
 
@@ -39,7 +41,14 @@ For an existing local scrape directory:
 
 ```bash
 python3 scripts/zhihu_answer_report.py \
-  "./data/entries"
+  "./data/reports/<bundle>/raw"
+```
+
+For an existing `answers.jsonl` dataset:
+
+```bash
+python3 scripts/zhihu_answer_report.py \
+  "./data/reports/<bundle>/analysis/answers.jsonl"
 ```
 
 ## Workflow
@@ -64,6 +73,7 @@ python3 scripts/zhihu_answer_report.py \
    `analysis/dashboard.html`: self-contained, offline-capable ECharts dashboard with a light/dark toggle, sentiment charts, LDA topic clustering, and an inferred author network graph.
    `analysis/summary.json`: structured metrics.
    `analysis/answers.jsonl`: row-level answer dataset for reuse.
+   `analysis/corpus.txt`: flattened text corpus used by the analysis.
    `raw/entries/*/index.md` and `raw/zhihu.db`: raw scrape artifacts when running from a URL.
 
 ## Default Command Pattern

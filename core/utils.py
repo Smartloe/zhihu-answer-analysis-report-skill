@@ -137,17 +137,27 @@ def sanitize_filename(name: str, max_length: int = 50) -> str:
 
     Removes or replaces:
     - / \\ : * ? " < > | (control characters)
+    - Trailing dots and spaces
 
     Args:
         name: Original filename / 原始文件名
-        max_length: Maximum length limit / 最大长度限制
+        max_length: Maximum size in UTF-8 bytes (not characters). Linux/ext4
+            limits a single path component to 255 bytes, so byte-based
+            truncation keeps long Chinese titles portable. / 最大 UTF-8 字节数
 
     Returns:
         Sanitized filename / 清洗后的文件名
     """
     name = re.sub(r"[/\\:*?\"<>|\x00-\x1f]", "_", name)
     name = name.strip(" .")
-    return name[:max_length] or "untitled"
+    if not name:
+        return "untitled"
+
+    encoded = name.encode("utf-8")
+    if len(encoded) > max_length:
+        # Decode with errors="ignore" so a multi-byte character is never split.
+        name = encoded[:max_length].decode("utf-8", errors="ignore").rstrip(" .")
+    return name or "untitled"
 
 
 def sanitize_author_name(name: str) -> str:
