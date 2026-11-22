@@ -98,6 +98,15 @@
     };
   }
 
+  function escapeHtml(value) {
+    return String(value === null || value === undefined ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   function tooltipStyle(c) {
     return {
       backgroundColor: c.tooltipBg,
@@ -166,7 +175,7 @@
           axisPointer: { type: "shadow", shadowStyle: { color: c.grid } },
           formatter: function (params) {
             var p = params[0];
-            return "<b>" + p.name + "</b><br>出现 " + p.value + " 次";
+            return "<b>" + escapeHtml(p.name) + "</b><br>出现 " + escapeHtml(p.value) + " 次";
           }
         },
         tooltipStyle(c)
@@ -243,7 +252,7 @@
           axisPointer: { type: "shadow", shadowStyle: { color: c.grid } },
           formatter: function (params) {
             var p = params[0];
-            return "<b>" + p.name + "</b><br>回答数 " + p.value;
+            return "<b>" + escapeHtml(p.name) + "</b><br>回答数 " + escapeHtml(p.value);
           }
         },
         tooltipStyle(c)
@@ -317,7 +326,7 @@
           axisPointer: { type: "shadow", shadowStyle: { color: c.grid } },
           formatter: function (params) {
             var p = params[0];
-            return "<b>" + p.name + "</b><br>回答数 " + p.value;
+            return "<b>" + escapeHtml(p.name) + "</b><br>回答数 " + escapeHtml(p.value);
           }
         },
         tooltipStyle(c)
@@ -378,15 +387,15 @@
             var point = params.data;
             return (
               "<b>" +
-              (point[3] || "未命名回答") +
+              escapeHtml(point[3] || "未命名回答") +
               "</b><br>" +
-              (point[4] ? point[4] + "<br>" : "") +
+              (point[4] ? escapeHtml(point[4]) + "<br>" : "") +
               "字数 " +
-              point[0] +
+              escapeHtml(point[0]) +
               " · 赞同 " +
-              point[1] +
+              escapeHtml(point[1]) +
               " · 情感 " +
-              point[2]
+              escapeHtml(point[2])
             );
           }
         },
@@ -480,10 +489,12 @@
             var row = rows[p.dataIndex] || {};
             return (
               "<b>" +
-              p.name +
+              escapeHtml(p.name) +
               "</b><br>回答数 " +
-              p.value +
-              (row.keywords ? "<br>关键词 " + row.keywords.split(" ").join(" · ") : "")
+              escapeHtml(p.value) +
+              (row.keywords
+                ? "<br>关键词 " + escapeHtml(row.keywords.split(" ").join(" · "))
+                : "")
             );
           }
         },
@@ -551,28 +562,28 @@
               var edge = params.data;
               return (
                 "<b>" +
-                edge.source +
+                escapeHtml(edge.source) +
                 " ↔ " +
-                edge.target +
+                escapeHtml(edge.target) +
                 "</b><br>关联强度 " +
-                edge.value +
-                (edge.relation ? "<br>" + edge.relation : "")
+                escapeHtml(edge.value) +
+                (edge.relation ? "<br>" + escapeHtml(edge.relation) : "")
               );
             }
             var node = params.data;
             return (
               "<b>" +
-              node.name +
+              escapeHtml(node.name) +
               "</b><br>回答 " +
-              node.answers +
+              escapeHtml(node.answers) +
               " · 赞同 " +
-              node.upvotes +
+              escapeHtml(node.upvotes) +
               "<br>主题 " +
-              node.topic +
+              escapeHtml(node.topic) +
               "<br>关键词 " +
-              node.keywords +
+              escapeHtml(node.keywords) +
               "<br>平均情感 " +
-              node.avg_sentiment
+              escapeHtml(node.avg_sentiment)
             );
           }
         },

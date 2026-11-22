@@ -55,6 +55,11 @@ def detect_dns_servers() -> Optional[str]:
     if os.environ.get("ZHIHU_DISABLE_DNS_FIX", "").strip().lower() in {"1", "true", "yes", "on"}:
         return None
 
+    # Windows libcurl uses the system resolver; forcing public DNS would
+    # bypass corporate split-DNS configuration.
+    if sys.platform.startswith("win"):
+        return None
+
     servers: list[str] = []
 
     def add(address: str) -> None:
@@ -82,10 +87,11 @@ def detect_dns_servers() -> Optional[str]:
         except Exception:
             pass
 
-    # Public fallbacks keep resolution working on machines with unusable
-    # system nameservers. Alibaba/Tencent first for mainland CDN accuracy.
-    for fallback in ("223.5.5.5", "119.29.29.29", "1.1.1.1"):
-        add(fallback)
+    # Only fall back to public DNS when the system configuration yielded no
+    # usable server; otherwise respect the machine's resolver.
+    if not servers:
+        for fallback in ("223.5.5.5", "119.29.29.29", "1.1.1.1"):
+            add(fallback)
 
     return ",".join(servers[:4]) or None
 
@@ -189,20 +195,29 @@ class ZhihuAPIClient:
 
         try:
             self.log.info("api_request", url=url)
-            # Use curl_cffi for fingerprint-level request
-            # 使用 curl_cffi 进行指纹级请求
-            response = self.session.get(url, headers=req_headers, timeout=15.0)
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 403:
-                self.log.error("api_forbidden", status=403, text=response.text[:200])
-                # Trigger rotation and notify upstream to retry
-                # 触发轮换并通知上游进行一次重试
-                cookie_manager.rotate_session()
-                # Reload underlying session / 重新载入底层 session
-                self._init_session()
-                raise Exception("请求遭到知乎安全盾 403 拦截，已尝试轮换 Cookie 池。")
-            else:
+            # One bounded retry after rotating the cookie pool.
+            for attempt in range(2):
+                # Use curl_cffi for fingerprint-level request
+                # 使用 curl_cffi 进行指纹级请求
+                response = self.session.get(url, headers=req_headers, timeout=15.0)
+                if response.status_code == 200:
+                    return response.json()
+                if response.status_code == 403:
+                    self.log.error("api_forbidden", status=403, text=response.text[:200])
+                    if attempt == 0:
+                        cookie_manager.rotate_session()
+                        self._init_session()
+                        req_headers = self._get_signature(path)
+                        continue
+                    raise Exception(
+                        "请求遭到知乎安全盾 403 拦截，已尝试轮换 Cookie 池。"
+                        "请从浏览器重新导出 cookies.json 中的 z_c0 / d_c0。"
+                    )
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise Exception(
+                        f"知乎 API 暂时不可用（HTTP {response.status_code}），"
+                        "请稍后重试或降低抓取频率。"
+                    )
                 self.log.error("api_error", status=response.status_code)
                 return None
         except Exception as e:

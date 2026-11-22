@@ -71,6 +71,20 @@ class PreparedSource:
         self.path = path
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须是大于 0 的整数")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("必须是大于等于 0 的整数")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Crawl Zhihu question answers and generate a Markdown analysis report.",
@@ -83,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--answer-cap",
-        type=int,
+        type=_positive_int,
         default=None,
         help="Optional cap for the number of answers to fetch in URL mode.",
     )
@@ -94,13 +108,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--top-k",
-        type=int,
+        type=_positive_int,
         default=30,
         help="Number of top keywords shown in tables and charts.",
     )
     parser.add_argument(
         "--min-word-length",
-        type=int,
+        type=_non_negative_int,
         default=2,
         help="Minimum token length kept in jieba results.",
     )
@@ -114,31 +128,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lda-topics",
-        type=int,
+        type=_non_negative_int,
         default=6,
         help="Number of LDA topics to infer. Use 0 to disable LDA.",
     )
     parser.add_argument(
         "--lda-words",
-        type=int,
+        type=_positive_int,
         default=8,
         help="Top words to keep per LDA topic.",
     )
     parser.add_argument(
         "--lda-max-iter",
-        type=int,
+        type=_positive_int,
         default=15,
         help="Max iterations for the LDA optimizer.",
     )
     parser.add_argument(
         "--network-max-nodes",
-        type=int,
+        type=_non_negative_int,
         default=18,
         help="Maximum number of author nodes kept in the inferred author network. Use 0 to disable it.",
     )
     parser.add_argument(
         "--network-max-edges",
-        type=int,
+        type=_non_negative_int,
         default=28,
         help="Maximum number of author links kept in the inferred author network.",
     )
@@ -234,9 +248,9 @@ def fetch_question_overview(prepared: PreparedSource) -> PreparedSource:
     if answers:
         title = answers[0].get("question", {}).get("title", title)
 
-    totals = page.get("paging", {}).get("totals") or len(answers)
+    totals = (page.get("paging") or {}).get("totals")
     prepared.question_title = title
-    prepared.total_answers = int(totals)
+    prepared.total_answers = int(totals) if totals else None
     return prepared
 
 
@@ -262,15 +276,32 @@ def build_output_folder_name(item_date: str, title: str, author: str, item_key: 
     folder_template = cfg.output.folder_format or "[{date}] {title}"
     try:
         rendered = folder_template.format(date=item_date, title=title, author=author)
-    except KeyError:
+    except (KeyError, IndexError, ValueError):
         rendered = f"[{item_date}] {title}"
 
     rendered = sanitize_filename(rendered, max_length=120)
     return f"{rendered} ({item_key})"
 
 
-def extract_text_from_markdown(markdown: str) -> str:
-    body = markdown.split("\n---\n", 1)[1] if "\n---\n" in markdown else markdown
+def extract_text_from_markdown(markdown: str | None) -> str:
+    """Strip the generated scrape header, then flatten Markdown to plain text.
+
+    Only a header that starts with ``# title`` and contains ``> **Author`` /
+    ``> **Source`` / ``> **Date`` metadata is removed. A bare ``---`` inside the
+    answer body must never truncate the text.
+    """
+    markdown = "" if markdown is None else str(markdown)
+    separator_index = markdown.find("\n---\n")
+    if separator_index != -1:
+        header = markdown[:separator_index]
+        has_heading = header.lstrip().startswith("# ")
+        has_metadata = bool(
+            re.search(r"^> \*\*(?:Author|Source|Date)\b", header, re.M)
+        )
+        if has_heading and has_metadata:
+            markdown = markdown[separator_index + len("\n---\n"):]
+
+    body = markdown
     body = re.sub(r"```.*?```", " ", body, flags=re.S)
     body = re.sub(r"`([^`]+)`", r"\1", body)
     body = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", body)
@@ -279,6 +310,7 @@ def extract_text_from_markdown(markdown: str) -> str:
     body = re.sub(r"^>\s*.*$", " ", body, flags=re.M)
     body = re.sub(r"^#+\s*", " ", body, flags=re.M)
     body = re.sub(r"^\s*[-*]\s+", " ", body, flags=re.M)
+    body = re.sub(r"^\s*---+\s*$", " ", body, flags=re.M)
     body = body.replace("|", " ")
     body = unescape(body)
     body = re.sub(r"\s+", " ", body)
@@ -294,6 +326,8 @@ def load_stopwords(extra_stopwords: str | None) -> set[str]:
     }
     if extra_stopwords:
         extra_path = Path(extra_stopwords).expanduser().resolve()
+        if not extra_path.is_file():
+            raise SystemExit(f"额外停用词文件不存在：{extra_path}")
         stopwords.update(
             line.strip()
             for line in extra_path.read_text(encoding="utf-8").splitlines()
@@ -306,7 +340,10 @@ def resolve_wordcloud_font(font_override: str | None) -> str:
     candidates: list[Path] = []
     env_font = os.environ.get("ZHIHU_FONT_PATH", "").strip()
     if font_override:
-        candidates.append(Path(font_override).expanduser())
+        override_path = Path(font_override).expanduser()
+        if not override_path.is_file():
+            raise SystemExit(f"指定的字体文件不存在：{override_path}")
+        candidates.append(override_path)
     if env_font:
         candidates.append(Path(env_font).expanduser())
 
@@ -366,7 +403,10 @@ async def fetch_and_save_answers(
     if not prepared.question_url:
         raise SystemExit("Question URL is required in fetch mode.")
 
-    target_answers = prepared.total_answers or 0
+    target_answers = prepared.total_answers
+    if target_answers is None:
+        target_answers = 200
+        print("⚠️ 未能获取回答总数，默认最多抓取 200 条；可用 --answer-cap 调整。")
     if target_answers <= 0:
         raise SystemExit("The question returned zero answers.")
 
@@ -383,15 +423,16 @@ async def fetch_and_save_answers(
     images_subdir = cfg.output.images_subdir or "images"
     db = ZhihuDatabase(str(raw_root / "zhihu.db"))
     saved_records: list[dict[str, Any]] = []
+    db_failures = 0
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
         for item in items:
-            title = sanitize_filename(item.get("title", "Untitled"), max_length=80)
-            author = sanitize_filename(item.get("author", "Unknown"), max_length=40)
-            item_date = item.get("date") or today
+            title = sanitize_filename(str(item.get("title") or "Untitled"), max_length=80)
+            author = sanitize_filename(str(item.get("author") or "Unknown"), max_length=40)
+            item_date = str(item.get("date") or today)
             item_key = sanitize_filename(
-                f"{item.get('type', 'answer')}-{item.get('id', 'unknown')}",
+                f"{item.get('type') or 'answer'}-{item.get('id') or 'unknown'}",
                 max_length=80,
             )
             folder_name = build_output_folder_name(item_date, title, author, item_key)
@@ -400,7 +441,7 @@ async def fetch_and_save_answers(
 
             img_map: dict[str, str] = {}
             if download_images:
-                img_urls = ZhihuConverter.extract_image_urls(item.get("html", ""))
+                img_urls = ZhihuConverter.extract_image_urls(item.get("html") or "")
                 if img_urls:
                     img_map = await ZhihuDownloader.download_images(
                         img_urls,
@@ -422,7 +463,8 @@ async def fetch_and_save_answers(
             full_markdown = header + markdown
             out_path = folder / "index.md"
             out_path.write_text(full_markdown, encoding="utf-8")
-            db.save_article(item, full_markdown)
+            if not db.save_article(item, full_markdown):
+                db_failures += 1
 
             saved_records.append(
                 {
@@ -439,6 +481,9 @@ async def fetch_and_save_answers(
             )
     finally:
         db.close()
+
+    if db_failures:
+        print(f"⚠️ {db_failures} 条回答写入 raw/zhihu.db 失败，Markdown 与报告不受影响。")
 
     return saved_records
 
@@ -481,11 +526,21 @@ def load_records_from_path(path: Path) -> list[dict[str, Any]]:
             if isinstance(payload, list):
                 return [item for item in payload if isinstance(item, dict)]
         else:
-            return [
-                json.loads(line)
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            records = []
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(
+                        f"answers 数据集第 {line_number} 行不是合法 JSON：{exc}"
+                    ) from exc
+                if isinstance(item, dict):
+                    records.append(item)
+            return records
 
     dataset_path = path / "analysis" / "answers.jsonl"
     if dataset_path.exists():
@@ -502,12 +557,56 @@ def load_records_from_path(path: Path) -> list[dict[str, Any]]:
     return [parse_markdown_file(markdown_path) for markdown_path in markdown_files]
 
 
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _coerce_int(value: Any) -> int | None:
+    """Parse ints from numbers and human counters such as ``1.2万`` / ``1,234``."""
+    if value is None or isinstance(value, bool):
+        return None if value is None else int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = _coerce_text(value).strip().replace(",", "").replace("，", "").replace(" ", "")
+    if not text:
+        return None
+    multiplier = 1
+    if text.endswith("万"):
+        multiplier = 10000
+        text = text[:-1]
+    elif text.endswith(("千", "k", "K")):
+        multiplier = 1000
+        text = text[:-1]
+    match = re.match(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return int(float(match.group(0)) * multiplier)
+    except ValueError:
+        return None
+
+
 def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
-    for record in records:
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise SystemExit(f"答案数据集第 {index + 1} 条不是 JSON 对象。")
         copied = dict(record)
-        copied["markdown_path"] = str(Path(copied["markdown_path"]).resolve())
-        copied["text"] = extract_text_from_markdown(copied.get("text", ""))
+        for key in ("id", "title", "author", "url", "date", "type"):
+            copied[key] = _coerce_text(copied.get(key))
+        copied["author"] = copied["author"].strip() or "Unknown"
+        copied["upvotes"] = _coerce_int(copied.get("upvotes"))
+
+        markdown_path = _coerce_text(copied.get("markdown_path")).strip()
+        copied["markdown_path"] = (
+            str(Path(markdown_path).expanduser().resolve()) if markdown_path else ""
+        )
+        copied["text"] = extract_text_from_markdown(copied.get("text"))
         normalized.append(copied)
     return normalized
 
@@ -703,7 +802,7 @@ def build_author_network(
     author_profiles: dict[str, dict[str, Any]] = {}
 
     for record in records:
-        author = (record.get("author") or "Unknown").strip() or "Unknown"
+        author = _coerce_text(record.get("author")).strip() or "Unknown"
         profile = author_profiles.setdefault(
             author,
             {
@@ -717,8 +816,8 @@ def build_author_network(
             },
         )
         profile["answers"] += 1
-        profile["upvotes"] += int(record.get("upvotes") or 0)
-        profile["char_total"] += int(record.get("char_count") or 0)
+        profile["upvotes"] += _coerce_int(record.get("upvotes")) or 0
+        profile["char_total"] += _coerce_int(record.get("char_count")) or 0
 
         sentiment = record.get("sentiment")
         if sentiment is not None:
@@ -904,8 +1003,8 @@ def build_summary(
 
     label_counts = Counter(sentiment_label(record.get("sentiment")) for record in records)
     bucket_counts = Counter(sentiment_bucket(record.get("sentiment")) for record in records)
-    timeline = Counter(record.get("date") or "unknown" for record in records)
-    authors = Counter(record.get("author") or "Unknown" for record in records)
+    timeline = Counter(_coerce_text(record.get("date")) or "unknown" for record in records)
+    authors = Counter(_coerce_text(record.get("author")) or "Unknown" for record in records)
     known_dates = sorted(date for date in timeline if date != "unknown")
 
     if upvote_records:
@@ -928,6 +1027,8 @@ def build_summary(
         "question_id": prepared.question_id,
         "question_title": prepared.question_title,
         "answer_count": len(records),
+        "requested_answers": prepared.total_answers,
+        "complete": prepared.total_answers is None or len(records) >= prepared.total_answers,
         "author_count": len(authors),
         "total_characters": sum(char_counts),
         "average_characters": round(sum(char_counts) / len(char_counts), 2) if char_counts else 0,
@@ -1009,6 +1110,35 @@ def create_wordcloud(
     )
     cloud.generate_from_frequencies(top_frequencies)
     cloud.to_file(str(output_path))
+
+
+def create_placeholder_wordcloud(output_path: Path, font_path: str, message: str) -> bool:
+    """Write a readable placeholder so a report never ships with a broken image."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return False
+
+    image = Image.new("RGB", (1800, 1050), "#fbf7ee")
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype(font_path, 54)
+    except Exception:
+        font = ImageFont.load_default()
+
+    text = f"词云暂不可用\n{message}"
+    try:
+        bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=20, align="center")
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        position = ((image.width - width) / 2, (image.height - height) / 2)
+        draw.multiline_text(
+            position, text, font=font, fill="#b8402a", spacing=20, align="center"
+        )
+        image.save(output_path)
+        return True
+    except Exception:
+        return False
 
 
 def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
@@ -1468,7 +1598,11 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
 
 
 def make_relative_link(target: str | Path, base_dir: Path) -> str:
-    return os.path.relpath(str(target), start=str(base_dir))
+    try:
+        return os.path.relpath(str(target), start=str(base_dir))
+    except ValueError:
+        # Windows: different drives have no relative path.
+        return Path(target).resolve().as_uri()
 
 
 def _md_cell(value: Any) -> str:
@@ -1480,7 +1614,10 @@ def _md_cell(value: Any) -> str:
 
 def _md_target(path: str | Path, base_dir: Path) -> str:
     """Percent-encode a local relative path so spaces and CJK survive Markdown."""
-    relative = make_relative_link(path, base_dir).replace(os.sep, "/")
+    relative = make_relative_link(path, base_dir)
+    if relative.startswith("file:"):
+        return relative
+    relative = relative.replace(os.sep, "/")
     return quote(relative, safe="/")
 
 
@@ -1560,6 +1697,14 @@ def write_report(
     else:
         date_range_display = "未提供"
 
+    requested_answers = summary.get("requested_answers")
+    if requested_answers is None:
+        completeness_display = "本地数据"
+    else:
+        completeness_display = (
+            "完整" if summary.get("complete", True) else "部分"
+        ) + f"（请求 {requested_answers} 条）"
+
     lines = [
         f"# {_md_cell(question_title)}",
         "",
@@ -1599,6 +1744,7 @@ def write_report(
             f"| 中位数字数 | {summary['median_characters']} |",
             f"| 最长回答 | {summary.get('max_characters', 0)} 字 |",
             f"| 最短回答 | {summary.get('min_characters', 0)} 字 |",
+            f"| 样本完整性 | {completeness_display} |",
             f"| 时间跨度 | {_md_cell(date_range_display)} |",
             f"| 平均情感分 | {summary.get('average_sentiment', 'N/A')} |",
             f"| 情感标准差 | {summary.get('sentiment_stddev', 'N/A')} |",
@@ -1741,14 +1887,18 @@ def write_report(
     )
 
     for item in summary["top_answers"]:
-        markdown_target = _md_target(item["markdown_path"], report_path.parent)
+        markdown_path = item.get("markdown_path") or ""
+        if markdown_path:
+            source_cell = f"[index.md]({_md_target(markdown_path, report_path.parent)})"
+        else:
+            source_cell = "—"
         lines.append(
             f"| {_md_cell(item['title'])} | {_md_cell(item['author'])} | "
             f"{_md_cell(item.get('date') or '')} | "
             f"{item.get('upvotes') if item.get('upvotes') is not None else 'N/A'} | "
             f"{item.get('char_count', 0)} | "
             f"{item.get('sentiment') if item.get('sentiment') is not None else 'N/A'} | "
-            f"[index.md]({markdown_target}) |"
+            f"{source_cell} |"
         )
 
     lines.extend(
@@ -1794,7 +1944,12 @@ def write_outputs(
     write_jsonl(answers_jsonl, records)
     summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     corpus_txt.write_text("\n\n".join(record.get("text", "") for record in records), encoding="utf-8")
-    create_wordcloud(frequencies, wordcloud_png, WordCloud, font_path)
+    try:
+        create_wordcloud(frequencies, wordcloud_png, WordCloud, font_path)
+    except SystemExit as exc:
+        print(f"⚠️ 词云生成失败：{exc}")
+        if not create_placeholder_wordcloud(wordcloud_png, font_path, str(exc)):
+            raise
     write_dashboard(dashboard_html, summary, records)
     write_report(report_md, summary, output_dir)
 
@@ -1802,17 +1957,24 @@ def write_outputs(
 async def main() -> None:
     args = parse_args()
     prepared = prepare_source(args.source)
+
     if prepared.mode == "url":
         require_cookies_for_url_mode()
-        prepared = fetch_question_overview(prepared)
-        if args.answer_cap is not None and prepared.total_answers is not None:
-            prepared.total_answers = min(prepared.total_answers, args.answer_cap)
 
-    output_dir = resolve_output_dir(prepared, args.output_dir)
-
+    # Validate local dependencies before touching the network.
     jieba, SnowNLP, WordCloud, LDA, CountVectorizer = load_analysis_dependencies()
     stopwords = load_stopwords(args.stopwords)
     font_path = resolve_wordcloud_font(args.font_path)
+
+    if prepared.mode == "url":
+        prepared = fetch_question_overview(prepared)
+        if args.answer_cap is not None:
+            if prepared.total_answers is None:
+                prepared.total_answers = args.answer_cap
+            else:
+                prepared.total_answers = min(prepared.total_answers, args.answer_cap)
+
+    output_dir = resolve_output_dir(prepared, args.output_dir)
 
     if prepared.mode == "url":
         output_dir.mkdir(parents=True, exist_ok=True)

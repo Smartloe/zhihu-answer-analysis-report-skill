@@ -145,13 +145,13 @@ class ZhihuDownloader:
             if not data:
                 raise Exception(f"专栏文章 {article_id} API 及降级抓取均失败，请手工检查 URL 或重新分配 Cookie。")
 
-        author = data.get("author", {}).get("name", "未知作者")
-        title = data.get("title", "未知专栏标题")
-        html = data.get("content", "")
-        upvotes = data.get("voteup_count", 0)
+        author = (data.get("author") or {}).get("name", "未知作者")
+        title = data.get("title") or "未知专栏标题"
+        html = data.get("content") or ""
+        upvotes = data.get("voteup_count") or 0
 
         # 将 timestamp 转为日历格式
-        created_sec = data.get("created", 0)
+        created_sec = data.get("created") or 0
         date_str = datetime.fromtimestamp(created_sec).strftime("%Y-%m-%d") if created_sec else datetime.today().strftime("%Y-%m-%d")
 
         # 挂载头图
@@ -163,8 +163,8 @@ class ZhihuDownloader:
             "id": article_id,
             "type": "article",
             "url": self.url,
-            "title": title.strip(),
-            "author": author.strip(),
+            "title": str(title).strip(),
+            "author": str(author).strip(),
             "html": html,
             "date": date_str,
             "upvotes": upvotes
@@ -183,20 +183,20 @@ class ZhihuDownloader:
         except Exception as e:
             raise Exception(f"回答 {answer_id} API 抓取失败: {e}")
 
-        author = data.get("author", {}).get("name", "未知作者")
-        title = data.get("question", {}).get("title", "未知问题")
-        html = data.get("content", "")
-        upvotes = data.get("voteup_count", 0)
+        author = (data.get("author") or {}).get("name", "未知作者")
+        title = (data.get("question") or {}).get("title", "未知问题")
+        html = data.get("content") or ""
+        upvotes = data.get("voteup_count") or 0
 
-        created_sec = data.get("created_time", 0)
+        created_sec = data.get("created_time") or 0
         date_str = datetime.fromtimestamp(created_sec).strftime("%Y-%m-%d") if created_sec else datetime.today().strftime("%Y-%m-%d")
 
         return {
             "id": answer_id,
             "type": "answer",
             "url": self.url,
-            "title": title.strip(),
-            "author": author.strip(),
+            "title": str(title).strip(),
+            "author": str(author).strip(),
             "html": html,
             "date": date_str,
             "upvotes": upvotes
@@ -224,6 +224,7 @@ class ZhihuDownloader:
         print(f"🎯 目标: API 分页抓取问题 {question_id} 的前 {target_limit} 个回答 (从第 {current_offset} 条开始)")
 
         results: List[dict] = []
+        seen_answer_ids: set[str] = set()
         page_index = 0
 
         while len(results) < target_limit:
@@ -248,24 +249,33 @@ class ZhihuDownloader:
                 break
 
             for data in answers_data:
-                author = data.get("author", {}).get("name", "未知作者")
-                title = data.get("question", {}).get("title", "未知问题")
-                html = data.get("content", "")
-                upvotes = data.get("voteup_count", 0)
+                answer_id = str(data.get("id", ""))
+                if answer_id and answer_id in seen_answer_ids:
+                    continue
+                try:
+                    author = (data.get("author") or {}).get("name", "未知作者")
+                    title = (data.get("question") or {}).get("title", "未知问题")
+                    html = data.get("content") or ""
+                    upvotes = data.get("voteup_count") or 0
 
-                created_sec = data.get("created_time", 0)
-                date_str = datetime.fromtimestamp(created_sec).strftime("%Y-%m-%d") if created_sec else datetime.today().strftime("%Y-%m-%d")
+                    created_sec = data.get("created_time") or 0
+                    date_str = datetime.fromtimestamp(created_sec).strftime("%Y-%m-%d") if created_sec else datetime.today().strftime("%Y-%m-%d")
 
-                results.append({
-                    "id": str(data.get("id", "")),
-                    "type": "answer",
-                    "url": f"https://www.zhihu.com/question/{question_id}/answer/{data.get('id', '')}",
-                    "title": title.strip(),
-                    "author": author.strip(),
-                    "html": html,
-                    "date": date_str,
-                    "upvotes": upvotes,
-                })
+                    results.append({
+                        "id": str(data.get("id", "")),
+                        "type": "answer",
+                        "url": f"https://www.zhihu.com/question/{question_id}/answer/{data.get('id', '')}",
+                        "title": str(title).strip(),
+                        "author": str(author).strip(),
+                        "html": html,
+                        "date": date_str,
+                        "upvotes": upvotes,
+                    })
+                    if results[-1]["id"]:
+                        seen_answer_ids.add(results[-1]["id"])
+                except Exception as exc:
+                    # One malformed/deleted answer must not abort the whole question.
+                    print(f"⚠️ 跳过一条无法解析的回答: {exc}")
 
             page_index += 1
             current_offset += len(answers_data)
@@ -341,50 +351,52 @@ class ZhihuDownloader:
         dest.mkdir(parents=True, exist_ok=True)
         url_to_local: dict[str, str] = {}
 
-        # 用作去重的 base name 集合
-        seen_base: set[str] = set()
-        # 真正需要下载的 URL 列表
-        urls_to_download: list[str] = []
+        # Choose the highest-quality variant per base name and keep both the
+        # original (possibly protocol-relative) and normalized URL as keys.
+        quality_by_suffix = {"_r": 4, "_l": 3, "_720w": 2}
+        candidates: dict[str, tuple[int, str, str]] = {}
 
-        for url in img_urls:
-            # 补全协议头
-            if url.startswith("//"):
-                url = "https:" + url
-
-            # 过滤特殊情况
-            if not url or url.startswith("data:") or "noavatar" in url:
+        for raw_url in img_urls:
+            raw_url = (raw_url or "").strip()
+            full_url = "https:" + raw_url if raw_url.startswith("//") else raw_url
+            if not full_url or full_url.startswith("data:") or "noavatar" in full_url:
                 continue
 
-            # 提取基础名用于去重：v2-xxx_720w.jpg → v2-xxx
-            base_name = url.split("/")[-1].split("?")[0]
-            for suffix in ["_720w", "_r", "_l"]:
+            base_name = full_url.split("/")[-1].split("?")[0]
+            quality = 1
+            for suffix, rank in quality_by_suffix.items():
                 if base_name.endswith(suffix + ".jpg"):
                     base_name = base_name.replace(suffix + ".jpg", ".jpg")
+                    quality = rank
                     break
                 if base_name.endswith(suffix + ".png"):
                     base_name = base_name.replace(suffix + ".png", ".png")
+                    quality = rank
                     break
 
-            # 如果已经见过同主题图片，跳过
-            if base_name in seen_base:
-                continue
-            seen_base.add(base_name)
-            urls_to_download.append(url)
+            previous = candidates.get(base_name)
+            if previous is None or quality > previous[0]:
+                candidates[base_name] = (quality, raw_url, full_url)
+
+        urls_to_download = [(raw, full) for _, raw, full in candidates.values()]
 
         if not urls_to_download:
             return url_to_local
 
         sem = asyncio.Semaphore(concurrency)
-        client = httpx.AsyncClient(headers={
-            "Referer": "https://www.zhihu.com/",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        })
+        client = httpx.AsyncClient(
+            headers={
+                "Referer": "https://www.zhihu.com/",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            },
+            follow_redirects=True,
+        )
 
-        async def worker(url: str):
+        async def worker(raw_url: str, full_url: str):
             async with sem:
                 try:
                     # 获取文件名，去除 URL 参数和尺寸后缀
-                    fname = url.split("/")[-1].split("?")[0]
+                    fname = full_url.split("/")[-1].split("?")[0]
                     for suffix in ["_720w", "_r", "_l"]:
                         if fname.endswith(suffix + ".jpg"):
                             fname = fname.replace(suffix + ".jpg", ".jpg")
@@ -399,26 +411,33 @@ class ZhihuDownloader:
 
                     # 保存路径带上 images/ 前缀（用于 Markdown 引用）
                     local_path = dest / fname
+                    local_rel = f"{relative_prefix}/{fname}"
 
                     if local_path.exists():
-                        url_to_local[url] = f"{relative_prefix}/{fname}"
+                        url_to_local[raw_url] = local_rel
+                        url_to_local[full_url] = local_rel
                         return
 
-                    resp = await client.get(url, timeout=timeout)
+                    resp = await client.get(full_url, timeout=timeout)
                     resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "").lower()
+                    if content_type and not content_type.startswith("image/"):
+                        print(f"⚠️ 跳过非图片响应 [{full_url}]: {content_type}")
+                        return
 
                     # 写入二进制文件
                     with open(local_path, "wb") as f:
                         f.write(resp.content)
 
-                    # 返回带 images/ 前缀的路径（用于 Markdown）
-                    url_to_local[url] = f"{relative_prefix}/{fname}"
+                    # 同时映射原始 // 地址和补全后的 https 地址
+                    url_to_local[raw_url] = local_rel
+                    url_to_local[full_url] = local_rel
 
                 except Exception as e:
-                    print(f"⚠️ 图片下载失败 [{url}]: {e}")
+                    print(f"⚠️ 图片下载失败 [{full_url}]: {e}")
 
         # 并发执行
-        tasks = [worker(url) for url in urls_to_download]
+        tasks = [worker(raw, full) for raw, full in urls_to_download]
         await asyncio.gather(*tasks)
         await client.aclose()
 
@@ -592,21 +611,21 @@ class ZhihuCreatorDownloader:
         将作者回答 API 结果转换为内部统一结构。
         """
         answer_id = str(data.get("id", ""))
-        question = data.get("question", {}) or {}
+        question = data.get("question") or {}
         question_id = question.get("id", "")
-        author = data.get("author", {}).get("name", "未知作者")
-        created_sec = data.get("created_time", 0)
+        author = (data.get("author") or {}).get("name", "未知作者")
+        created_sec = data.get("created_time") or 0
         date_str = datetime.fromtimestamp(created_sec).strftime("%Y-%m-%d") if created_sec else datetime.today().strftime("%Y-%m-%d")
 
         return {
             "id": answer_id,
             "type": "answer",
             "url": f"https://www.zhihu.com/question/{question_id}/answer/{answer_id}" if question_id else f"https://www.zhihu.com/answer/{answer_id}",
-            "title": (question.get("title") or "未知问题").strip(),
-            "author": author.strip(),
-            "html": data.get("content", ""),
+            "title": str(question.get("title") or "未知问题").strip(),
+            "author": str(author).strip(),
+            "html": data.get("content") or "",
             "date": date_str,
-            "upvotes": data.get("voteup_count", 0),
+            "upvotes": data.get("voteup_count") or 0,
             "creator_url_token": self.url_token,
         }
 
@@ -616,10 +635,10 @@ class ZhihuCreatorDownloader:
         将作者专栏 API 结果转换为内部统一结构。
         """
         article_id = str(data.get("id", ""))
-        author = data.get("author", {}).get("name", "未知作者")
-        created_sec = data.get("created", 0) or data.get("updated", 0)
+        author = (data.get("author") or {}).get("name", "未知作者")
+        created_sec = data.get("created") or data.get("updated") or 0
         date_str = datetime.fromtimestamp(created_sec).strftime("%Y-%m-%d") if created_sec else datetime.today().strftime("%Y-%m-%d")
-        html = data.get("content", "")
+        html = data.get("content") or ""
         image_url = data.get("image_url") or data.get("thumbnail")
         if image_url:
             html = f'<img src="{image_url}" alt="TitleImage"><br>{html}'
@@ -628,10 +647,10 @@ class ZhihuCreatorDownloader:
             "id": article_id,
             "type": "article",
             "url": f"https://zhuanlan.zhihu.com/p/{article_id}",
-            "title": (data.get("title") or "未知专栏标题").strip(),
-            "author": author.strip(),
+            "title": str(data.get("title") or "未知专栏标题").strip(),
+            "author": str(author).strip(),
             "html": html,
             "date": date_str,
-            "upvotes": data.get("voteup_count", 0),
+            "upvotes": data.get("voteup_count") or 0,
             "creator_url_token": self.url_token,
         }

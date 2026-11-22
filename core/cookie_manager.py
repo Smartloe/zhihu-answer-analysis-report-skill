@@ -72,7 +72,7 @@ def has_real_cookie_values(path: Path) -> bool:
     检查 Cookie 文件是否至少包含一个真实的知乎会话键值
     """
     session = load_cookie_dict(path)
-    return "z_c0" in session or "d_c0" in session
+    return "z_c0" in session
 
 
 class CookieManager:
@@ -107,7 +107,7 @@ class CookieManager:
         # 2. Load cookie_pool/**/*.json
         # 加载 cookie_pool/**/*.json
         if self.pool_dir.exists() and self.pool_dir.is_dir():
-            for filepath in self.pool_dir.glob("*.json"):
+            for filepath in self.pool_dir.rglob("*.json"):
                 session = self._parse_json_file(filepath)
                 if session and self._is_valid_session(session) and session not in self.sessions:
                     self.sessions.append(session)
@@ -136,9 +136,10 @@ class CookieManager:
         Verify if this session has minimum required Zhihu core key-values
         验证此 session 是否拥有最低限度的知乎核心键值
         """
-        # z_c0 is Zhihu's required identity token
-        # z_c0 是知乎必须的身份令牌基础
-        return "z_c0" in session or "d_c0" in session
+        # z_c0 is Zhihu's required identity token. d_c0 alone is a guest
+        # device id and receives 403 from the answer API.
+        # z_c0 是知乎必须的身份令牌；只有 d_c0 会被 API 以 403 拒绝。
+        return "z_c0" in session
 
     def get_current_session(self) -> Optional[Dict[str, str]]:
         """

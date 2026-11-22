@@ -231,7 +231,7 @@ def test_report_table_row_counts_match_summary(path_bundle):
         (path_bundle / "analysis" / "summary.json").read_text(encoding="utf-8")
     )
 
-    assert len(_table_rows(report, "| 指标 | 数值 |")) == 11
+    assert len(_table_rows(report, "| 指标 | 数值 |")) == 12
     assert len(_table_rows(report, "| 关键词 | 频次 |")) == min(
         20, len(summary["top_keywords"])
     )
@@ -406,6 +406,37 @@ def test_create_wordcloud_rejects_empty_frequencies(
         report_module.create_wordcloud(
             Counter(), tmp_path / "wordcloud.png", analysis_deps["WordCloud"], font_path
         )
+
+
+def test_empty_keywords_still_generate_a_report(run_cli, tmp_path):
+    dataset = tmp_path / "empty.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "1",
+                "title": "停顿词样本",
+                "author": "作者",
+                "url": "https://www.zhihu.com/answer/1",
+                "date": "2026-01-01",
+                "type": "answer",
+                "upvotes": 1,
+                "markdown_path": "",
+                "text": "的 了 和 是 在 就 都 而",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "bundle"
+    result = run_cli(dataset, "--output-dir", output)
+
+    assert result.returncode == 0, result.stderr
+    assert (output / "report.md").is_file()
+    assert (output / "analysis" / "dashboard.html").is_file()
+    assert (output / "analysis" / "wordcloud.png").read_bytes()[:8] == (
+        b"\x89PNG\r\n\x1a\n"
+    )
 
 
 def test_write_outputs_creates_complete_bundle(

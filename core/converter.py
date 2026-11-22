@@ -24,6 +24,8 @@ from typing import Optional, Dict
 from bs4 import BeautifulSoup, Tag
 from markdownify import MarkdownConverter
 
+from .utils import get_image_base_name
+
 
 class ZhihuConverter:
     """
@@ -249,7 +251,8 @@ class ZhihuConverter:
         例如: {*{20}{c}} → {cccccccccccccccccccc}
         """
         def expand_repeat(match):
-            count = int(match.group(1))
+            # Cap the expansion so hostile *{100000000}{c} input cannot exhaust memory.
+            count = min(int(match.group(1)), 200)
             char = match.group(2)
             return char * count
 
@@ -270,6 +273,17 @@ class _MarkdownBridge(MarkdownConverter):
         self.img_map = img_map or {}
         super().__init__(**kwargs)
 
+    def _local_for_src(self, src: str) -> str:
+        """Match a downloaded image by exact URL, then by size-normalized name."""
+        exact = self.img_map.get(src)
+        if exact:
+            return exact
+        base = get_image_base_name(src)
+        for key, local in self.img_map.items():
+            if get_image_base_name(key) == base:
+                return local
+        return src
+
     def convert_img(self, el: Tag, text: str, parent_tags: set) -> str:
         src = (
             el.get("data-actualsrc")
@@ -284,5 +298,5 @@ class _MarkdownBridge(MarkdownConverter):
         ):
             return ""
         alt = el.get("alt", "")
-        local = self.img_map.get(src, src)
+        local = self._local_for_src(src)
         return f"![{alt}]({local})\n\n"
