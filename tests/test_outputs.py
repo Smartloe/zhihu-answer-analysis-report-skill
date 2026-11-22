@@ -231,7 +231,7 @@ def test_report_table_row_counts_match_summary(path_bundle):
         (path_bundle / "analysis" / "summary.json").read_text(encoding="utf-8")
     )
 
-    assert len(_table_rows(report, "| 指标 | 数值 |")) == 12
+    assert len(_table_rows(report, "| 指标 | 数值 |")) == 13
     assert len(_table_rows(report, "| 关键词 | 频次 |")) == min(
         20, len(summary["top_keywords"])
     )

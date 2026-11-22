@@ -1037,6 +1037,7 @@ def build_summary(
         "min_characters": min(char_counts) if char_counts else 0,
         "average_sentiment": round(sum(sentiments) / len(sentiments), 4) if sentiments else None,
         "sentiment_stddev": round(statistics.pstdev(sentiments), 4) if len(sentiments) > 1 else 0,
+        "sentiment_missing": len(records) - len(sentiments),
         "sentiment_labels": dict(label_counts),
         "sentiment_buckets": dict(bucket_counts),
         "top_keywords": [
@@ -1748,6 +1749,7 @@ def write_report(
             f"| 时间跨度 | {_md_cell(date_range_display)} |",
             f"| 平均情感分 | {summary.get('average_sentiment', 'N/A')} |",
             f"| 情感标准差 | {summary.get('sentiment_stddev', 'N/A')} |",
+            f"| 情感缺失 | {summary.get('sentiment_missing', 0)} 条 |",
             f"| 正向 / 中性 / 负向 | {labels.get('positive', 0)} / {labels.get('neutral', 0)} / {labels.get('negative', 0)} |",
             "",
             "---",
@@ -1856,6 +1858,15 @@ def write_report(
     for bucket in ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0", "unknown"]:
         name = "未知" if bucket == "unknown" else bucket
         lines.append(f"| {name} | {summary['sentiment_buckets'].get(bucket, 0)} |")
+
+    missing_sentiment = summary.get("sentiment_missing", 0)
+    if missing_sentiment:
+        lines.extend(
+            [
+                "",
+                f"> {missing_sentiment} 条回答缺少可分析正文或 SnowNLP 分析失败，未计入平均情感分。",
+            ]
+        )
 
     lines.extend(
         [
