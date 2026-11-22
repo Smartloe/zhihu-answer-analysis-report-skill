@@ -19,9 +19,10 @@ import statistics
 import sys
 from collections import Counter
 from datetime import datetime
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -37,10 +38,12 @@ from core.config import get_config
 from core.converter import ZhihuConverter
 from core.db import ZhihuDatabase
 from core.scraper import ZhihuDownloader
-from core.utils import sanitize_filename
+from core.utils import extract_urls, sanitize_filename
 
 
-QUESTION_RE = re.compile(r"https?://www\.zhihu\.com/question/(\d+)(?:/answer/(\d+))?")
+QUESTION_RE = re.compile(
+    r"https?://(?:www\.|m\.)?zhihu\.com/question/(\d+)(?:/answer/(\d+))?"
+)
 SOURCE_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 DATE_RE = re.compile(r"^\> \*\*Date / 日期\*\*: ([0-9-]+)", re.M)
 AUTHOR_RE = re.compile(r"^\> \*\*Author / 作者\*\*: (.+)$", re.M)
@@ -188,6 +191,13 @@ def prepare_source(source: str) -> PreparedSource:
 
     match = QUESTION_RE.match(source)
     if not match:
+        # Accept pasted share text such as "如何评价… https://www.zhihu.com/question/123"
+        embedded = [url for url in extract_urls(source) if QUESTION_RE.match(url)]
+        if embedded:
+            source = embedded[0]
+            match = QUESTION_RE.match(source)
+
+    if not match:
         raise SystemExit("Only Zhihu question URLs, answer URLs, or local paths are supported.")
 
     question_id = match.group(1)
@@ -293,18 +303,32 @@ def load_stopwords(extra_stopwords: str | None) -> set[str]:
 
 
 def resolve_wordcloud_font(font_override: str | None) -> str:
-    candidates = []
+    candidates: list[Path] = []
+    env_font = os.environ.get("ZHIHU_FONT_PATH", "").strip()
     if font_override:
         candidates.append(Path(font_override).expanduser())
+    if env_font:
+        candidates.append(Path(env_font).expanduser())
 
     candidates.extend(
         Path(candidate)
         for candidate in [
+            # macOS
             "/System/Library/Fonts/Supplemental/Songti.ttc",
             "/System/Library/Fonts/STHeiti Medium.ttc",
             "/System/Library/Fonts/STHeiti Light.ttc",
             "/System/Library/Fonts/PingFang.ttc",
             "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/259e8f5a322e8dae602d51ac00aefb3d6b05c224.asset/AssetData/SimSong.ttc",
+            # Linux
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            # Windows
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+            "C:/Windows/Fonts/simsun.ttc",
         ]
     )
 
@@ -312,7 +336,26 @@ def resolve_wordcloud_font(font_override: str | None) -> str:
         if candidate.exists():
             return str(candidate.resolve())
 
-    raise SystemExit("No usable Chinese font found for the word cloud. Pass --font-path explicitly.")
+    # Last resort on Linux: ask fontconfig for any installed CJK font.
+    if sys.platform.startswith("linux"):
+        try:
+            import subprocess
+
+            output = subprocess.run(
+                ["fc-match", "-f", "%{file}", "sans-serif:lang=zh-cn"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            ).stdout.strip()
+            if output and Path(output).exists():
+                return output
+        except Exception:
+            pass
+
+    raise SystemExit(
+        "未找到可用的中文字体，无法生成词云。请通过 --font-path 指定字体文件，"
+        "或设置环境变量 ZHIHU_FONT_PATH。"
+    )
 
 
 async def fetch_and_save_answers(
@@ -432,12 +475,17 @@ def parse_markdown_file(path: Path) -> dict[str, Any]:
 
 def load_records_from_path(path: Path) -> list[dict[str, Any]]:
     path = path.resolve()
-    if path.is_file() and path.name == "answers.jsonl":
-        return [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+    if path.is_file() and path.suffix.lower() in {".jsonl", ".json"}:
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+        else:
+            return [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
 
     dataset_path = path / "analysis" / "answers.jsonl"
     if dataset_path.exists():
@@ -516,7 +564,7 @@ def run_lda_topics(
     CountVectorizer: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
     if topic_count <= 0:
-        return [], [], "LDA disabled"
+        return [], [], "已关闭 LDA 主题聚类。"
 
     docs: list[list[str]] = []
     doc_indices: list[int] = []
@@ -526,8 +574,11 @@ def run_lda_topics(
             docs.append(tokens)
             doc_indices.append(idx)
 
-    if len(docs) < max(8, topic_count * 2):
-        return [], [], "Insufficient documents for LDA"
+    minimum_docs = max(8, topic_count * 2)
+    if len(docs) < minimum_docs:
+        return [], [], (
+            f"有效回答仅 {len(docs)} 条，至少需要 {minimum_docs} 条才能进行 LDA 主题聚类。"
+        )
 
     min_df = 2 if len(docs) >= 20 else 1
     vectorizer = CountVectorizer(
@@ -537,13 +588,17 @@ def run_lda_topics(
         min_df=min_df,
         max_df=0.95,
     )
-    doc_term = vectorizer.fit_transform(docs)
+    try:
+        doc_term = vectorizer.fit_transform(docs)
+    except ValueError:
+        # CountVectorizer raises when max_df/min_df prune every term.
+        return [], [], "有效词汇量不足（词项被文档频率过滤），无法形成稳定的主题聚类。"
     if doc_term.shape[1] < 6:
-        return [], [], "Insufficient vocabulary for LDA"
+        return [], [], "有效词汇量不足，无法形成稳定的主题聚类。"
 
     max_topics = min(topic_count, doc_term.shape[0], doc_term.shape[1])
     if max_topics < 2:
-        return [], [], "Insufficient data for LDA"
+        return [], [], "可用于聚类的主题数量不足（少于 2 个）。"
     if max_topics != topic_count:
         topic_count = max_topics
 
@@ -638,7 +693,7 @@ def build_author_network(
     max_edges: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
     if max_nodes <= 0 or max_edges <= 0:
-        return {"nodes": [], "links": [], "categories": []}, [], "Author network disabled"
+        return {"nodes": [], "links": [], "categories": []}, [], "已关闭作者关联网络。"
 
     topic_word_map = {
         int(topic.get("topic_id")): list(topic.get("top_words") or [])
@@ -678,7 +733,11 @@ def build_author_network(
             profile["keywords"].update(tokens)
 
     if len(author_profiles) < 3:
-        return {"nodes": [], "links": [], "categories": []}, [], "Insufficient authors for author network"
+        return (
+            {"nodes": [], "links": [], "categories": []},
+            [],
+            f"仅检测到 {len(author_profiles)} 位作者，至少需要 3 位才能构建作者关联网络。",
+        )
 
     ranked_profiles = sorted(
         author_profiles.values(),
@@ -687,7 +746,11 @@ def build_author_network(
     )[:max_nodes]
 
     if len(ranked_profiles) < 3:
-        return {"nodes": [], "links": [], "categories": []}, [], "Insufficient authors for author network"
+        return (
+            {"nodes": [], "links": [], "categories": []},
+            [],
+            f"保留的作者仅 {len(ranked_profiles)} 位，至少需要 3 位才能构建作者关联网络。",
+        )
 
     categories: list[dict[str, str]] = []
     category_map: dict[str, int] = {}
@@ -772,7 +835,11 @@ def build_author_network(
     links = links[:max_edges]
 
     if not links:
-        return {"nodes": [], "links": [], "categories": []}, [], "Authors were found, but no strong inferred links were detected"
+        return (
+            {"nodes": [], "links": [], "categories": []},
+            [],
+            "作者已识别，但回答之间的关键词与主题重合度不足以形成可靠关联。",
+        )
 
     connected_authors = {
         author
@@ -865,6 +932,8 @@ def build_summary(
         "total_characters": sum(char_counts),
         "average_characters": round(sum(char_counts) / len(char_counts), 2) if char_counts else 0,
         "median_characters": statistics.median(char_counts) if char_counts else 0,
+        "max_characters": max(char_counts) if char_counts else 0,
+        "min_characters": min(char_counts) if char_counts else 0,
         "average_sentiment": round(sum(sentiments) / len(sentiments), 4) if sentiments else None,
         "sentiment_stddev": round(statistics.pstdev(sentiments), 4) if len(sentiments) > 1 else 0,
         "sentiment_labels": dict(label_counts),
@@ -916,15 +985,27 @@ def create_wordcloud(
 ) -> None:
     top_frequencies = dict(frequencies.most_common(200))
     if not top_frequencies:
-        raise SystemExit("No usable keywords were produced for the word cloud.")
+        raise SystemExit("没有可用于词云的关键词，请检查回答文本或停用词配置。")
+
+    palette = ["#b8402a", "#1f5a4a", "#35597c", "#a9761c", "#7a3e5d"]
+
+    def color_func(word: str, *args: Any, **kwargs: Any) -> str:
+        # Deterministic colour per word keeps the image stable across runs.
+        return palette[sum(ord(char) for char in word) % len(palette)]
 
     cloud = WordCloud(
-        width=1600,
-        height=900,
-        background_color="white",
+        width=1800,
+        height=1050,
+        background_color="#fbf7ee",
         font_path=font_path,
-        max_words=200,
+        max_words=120,
         collocations=False,
+        prefer_horizontal=1.0,
+        relative_scaling=0.4,
+        max_font_size=170,
+        min_font_size=14,
+        margin=16,
+        color_func=color_func,
     )
     cloud.generate_from_frequencies(top_frequencies)
     cloud.to_file(str(output_path))
@@ -935,37 +1016,117 @@ def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _html_text(value: Any) -> str:
+    """Escape arbitrary text before inserting it into the dashboard markup."""
+    return escape(str(value if value is not None else ""), quote=True)
+
+
+def _json_for_script(payload: Any) -> str:
+    """Serialize data for an inline <script type="application/json"> block."""
+    return json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+
+
+def _dashboard_table(caption: str, headers: list[str], rows: list[list[Any]]) -> str:
+    if not rows:
+        return ""
+    head = "".join(f"<th>{_html_text(item)}</th>" for item in headers)
+    body = []
+    for row in rows:
+        cells = []
+        for index, cell in enumerate(row):
+            css = ' class="num"' if index > 0 else ""
+            cells.append(f"<td{css}>{_html_text(cell)}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return (
+        f'<details class="data-table"><summary>{_html_text(caption)}</summary>'
+        '<div class="table-wrap"><table><thead><tr>'
+        f"{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div></details>"
+    )
+
+
+def _dashboard_panel(
+    kicker: str,
+    title: str,
+    description: str,
+    metric: str | None,
+    body: str,
+    column: str = "col-6",
+) -> str:
+    metric_html = (
+        f'<span class="panel-metric">{_html_text(metric)}</span>' if metric else ""
+    )
+    return f"""
+      <article class="panel {column}">
+        <header class="panel-head">
+          <div class="panel-kicker"><span>{_html_text(kicker)}</span>{metric_html}</div>
+          <h3>{_html_text(title)}</h3>
+          <p class="panel-desc">{_html_text(description)}</p>
+        </header>
+        {body}
+      </article>
+"""
+
+
+def _dashboard_section(index: str, title: str, description: str, body: str) -> str:
+    return f"""
+    <section class="section">
+      <div class="section-head">
+        <span class="section-index">{_html_text(index)}</span>
+        <h2>{_html_text(title)}</h2>
+        <p>{_html_text(description)}</p>
+      </div>
+      {body}
+    </section>
+"""
+
+
 def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str, Any]]) -> None:
-    top_keywords = summary["top_keywords"][:20]
-    timeline = summary["timeline"]
-    sentiment_buckets = summary["sentiment_buckets"]
+    top_keywords = summary.get("top_keywords", [])
+    timeline = summary.get("timeline", [])
+    sentiment_buckets = summary.get("sentiment_buckets", {})
+    sentiment_labels = summary.get("sentiment_labels", {})
     lda_topics = summary.get("lda_topics") or []
     lda_distribution = summary.get("lda_topic_distribution") or []
+    lda_note = summary.get("lda_note")
     author_network = summary.get("author_network") or {}
     network_nodes = author_network.get("nodes") or []
     network_links = author_network.get("links") or []
     network_highlights = summary.get("author_network_highlights") or []
     network_note = summary.get("author_network_note") or (
-        "作者关系图基于回答内容相似度推断，不代表知乎真实社交关系。"
+        "作者关系图基于回答主题、关键词重合度与情感接近度推断，不代表知乎真实关注、评论或私下社交关系。"
     )
-    sentiment_labels = summary.get("sentiment_labels", {})
+
     question_title = summary.get("question_title") or "知乎回答分析"
+    question_url = summary.get("question_url")
+    question_id = summary.get("question_id")
+    generated_at = summary.get("generated_at") or ""
+    answer_count = summary.get("answer_count", 0)
+    author_count = summary.get("author_count") or len(
+        {record.get("author") or "Unknown" for record in records}
+    )
+    total_characters = summary.get("total_characters", 0)
+    average_characters = summary.get("average_characters", 0)
+    median_characters = summary.get("median_characters", 0)
     average_sentiment = summary.get("average_sentiment")
-    average_sentiment_display = average_sentiment if average_sentiment is not None else "N/A"
+    average_sentiment_display = (
+        average_sentiment if average_sentiment is not None else "N/A"
+    )
     positive_count = sentiment_labels.get("positive", 0)
     neutral_count = sentiment_labels.get("neutral", 0)
     negative_count = sentiment_labels.get("negative", 0)
-    author_count = summary.get("author_count") or len({record.get("author") or "Unknown" for record in records})
-    leading_keyword = top_keywords[0]["word"] if top_keywords else "N/A"
+
     date_range = summary.get("date_range") or {}
     date_start = date_range.get("start")
     date_end = date_range.get("end")
     if date_start and date_end:
-        date_range_display = f"{date_start} - {date_end}" if date_start != date_end else date_start
+        date_range_display = (
+            f"{date_start} — {date_end}" if date_start != date_end else date_start
+        )
     elif date_start or date_end:
         date_range_display = date_start or date_end
     else:
         date_range_display = "未提供"
+
     bucket_order = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0", "unknown"]
     dominant_bucket = max(
         [name for name in bucket_order if name != "unknown"],
@@ -973,11 +1134,20 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         default="unknown",
     )
     dominant_bucket_count = sentiment_buckets.get(dominant_bucket, 0)
-    timeline_peak = max(timeline, key=lambda item: item.get("count", 0), default={"date": "N/A", "count": 0})
-    timeline_peak_label = f"{timeline_peak.get('date', 'N/A')} / {timeline_peak.get('count', 0)} 条"
-    lda_topic_count = len(lda_topics)
-    network_node_count = len(network_nodes)
-    network_edge_count = len(network_links)
+    sentiment_metric = (
+        f"主峰 · {dominant_bucket.replace('-', '–')} / {dominant_bucket_count} 条"
+        if dominant_bucket_count
+        else "暂无情感样本"
+    )
+    leading_keyword = top_keywords[0]["word"] if top_keywords else "N/A"
+    timeline_peak = max(
+        timeline, key=lambda item: item.get("count", 0), default={"date": "N/A", "count": 0}
+    )
+    timeline_metric = (
+        f"峰值 · {timeline_peak.get('date', 'N/A')} / {timeline_peak.get('count', 0)} 条"
+        if timeline_peak.get("count")
+        else "暂无时间数据"
+    )
 
     scatter_points = []
     for record in records:
@@ -986,977 +1156,311 @@ def write_dashboard(path: Path, summary: dict[str, Any], records: list[dict[str,
         scatter_points.append(
             [
                 record.get("char_count", 0),
-                0 if record.get("upvotes") is None else record.get("upvotes"),
+                record.get("upvotes") or 0,
                 record.get("sentiment"),
                 record.get("title", ""),
+                record.get("author", ""),
             ]
         )
-    scatter_count = len(scatter_points)
 
-    topic_cards_html = ""
+    findings = build_key_findings(summary)
+    notes_html = "".join(f"<li>{_html_text(item)}</li>" for item in findings)
+
+    keyword_rows = [
+        [item.get("word", ""), item.get("count", 0)]
+        for item in top_keywords[:20]
+    ]
+    sentiment_rows = [
+        [
+            "未知" if bucket == "unknown" else bucket.replace("-", "–"),
+            sentiment_buckets.get(bucket, 0),
+        ]
+        for bucket in bucket_order
+    ]
+    timeline_rows = [
+        [item.get("date", "未知"), item.get("count", 0)] for item in timeline
+    ]
+
+    keywords_body = '<div id="keywords" class="chart chart-tall"></div>'
+    if not top_keywords:
+        keywords_body = (
+            '<div class="empty-state"><strong>暂无可用关键词。</strong> '
+            "样本过短或全部命中停用词时，词频图会自动留空。</div>"
+        )
+    keywords_body += _dashboard_table(
+        "关键词数据表", ["关键词", "出现次数"], keyword_rows
+    )
+
+    sentiment_body = '<div id="sentiment" class="chart"></div>'
+    sentiment_body += _dashboard_table(
+        "情感分桶数据表", ["区间", "回答数"], sentiment_rows
+    )
+
+    timeline_body = (
+        '<div id="timeline" class="chart"></div>'
+        if timeline
+        else (
+            '<div id="timeline" class="chart" data-empty="1"></div>'
+            '<div class="empty-state"><strong>暂无发布时间。</strong> '
+            "样本缺少日期字段时，时间线会自动留空。</div>"
+        )
+    )
+    timeline_body += _dashboard_table(
+        "时间线数据表", ["日期", "回答数"], timeline_rows
+    )
+
+    if scatter_points:
+        scatter_body = '<div id="scatter" class="chart chart-tall"></div>'
+    else:
+        scatter_body = (
+            '<div id="scatter" class="chart chart-tall" data-empty="1"></div>'
+            '<div class="empty-state"><strong>暂无情感分样本。</strong> '
+            "缺少可分析文本时，互动散点图会自动留空。</div>"
+        )
+
+    keywords_panel = _dashboard_panel(
+        "Topic Language",
+        "高频关键词 Top 20",
+        "横向条形按出现频次排序，直接标注数值，避免长词标签旋转后互相遮挡。",
+        f"Top 1 · {leading_keyword}",
+        keywords_body,
+        "col-7",
+    )
+    sentiment_panel = _dashboard_panel(
+        "Sentiment Distribution",
+        "情感分分布",
+        "按 SnowNLP 分值区间统计回答数量，颜色从负向过渡到正向。",
+        sentiment_metric,
+        sentiment_body,
+        "col-5",
+    )
+    timeline_panel = _dashboard_panel(
+        "Activity Rhythm",
+        "回答时间线",
+        "按发布日期观察回答是否集中在同一天爆发。",
+        timeline_metric,
+        timeline_body,
+        "col-5",
+    )
+    upvote_available = any((point[1] or 0) > 0 for point in scatter_points)
+    scatter_description = (
+        "每个点是一条回答：横轴为字数，纵轴为赞同数，颜色表示情感倾向。"
+        if upvote_available
+        else "每个点是一条回答：横轴为字数，颜色表示情感倾向。当前数据源不含赞同数，纵轴统一为 0。"
+    )
+    scatter_panel = _dashboard_panel(
+        "Engagement Map",
+        "篇幅 × 赞同 × 情感",
+        scatter_description,
+        f"样本点 · {len(scatter_points)}",
+        scatter_body,
+        "col-7",
+    )
+
+    topic_cards = []
+    for topic in lda_topics:
+        words = " · ".join(topic.get("top_words") or []) or "未提取关键词"
+        share = float(topic.get("doc_share") or 0) * 100
+        topic_cards.append(
+            f"""
+          <div class="topic-card">
+            <div class="topic-title">Topic {_html_text(topic.get('topic_id', ''))}</div>
+            <div class="topic-words">{_html_text(words)}</div>
+            <div class="topic-meta">覆盖 {_html_text(topic.get('doc_count', 0))} 条 · 占比 {share:.1f}%</div>
+          </div>
+"""
+        )
+
     if lda_topics:
-        topic_cards = []
-        for topic in lda_topics:
-            topic_id = topic.get("topic_id", "")
-            words = topic.get("top_words") or []
-            keywords = " / ".join(words[:6]) if words else "未提取关键词"
-            count = topic.get("doc_count", 0)
-            share = topic.get("doc_share", 0)
-            share_display = f"{share * 100:.1f}%"
-            topic_cards.append(
-                f"""
-          <div class=\"topic-card\">
-            <div class=\"topic-title\">主题 {topic_id}</div>
-            <div class=\"topic-words\">{keywords}</div>
-            <div class=\"topic-meta\">回答 {count} · 占比 {share_display}</div>
+        topics_body = (
+            '<div id="topics" class="chart chart-tall"></div>'
+            f'<div class="topic-grid">{"".join(topic_cards)}</div>'
+        )
+    else:
+        note = lda_note or "未启用 LDA 或数据不足，未生成主题聚类结果。"
+        topics_body = (
+            f'<div class="empty-state"><strong>本次未生成主题聚类。</strong> '
+            f"{_html_text(note)}</div>"
+        )
+
+    topics_panel = _dashboard_panel(
+        "Latent Dirichlet Allocation",
+        "LDA 主题聚类",
+        "从回答文本中归纳话题簇；样本不足时自动跳过统计推断。",
+        f"主题数 · {len(lda_topics)}" if lda_topics else "已跳过",
+        topics_body,
+        "col-12",
+    )
+
+    network_cards = []
+    for link in network_highlights:
+        network_cards.append(
+            f"""
+          <div class="network-card">
+            <div class="network-pair">{_html_text(link.get('source', 'Unknown'))} ↔ {_html_text(link.get('target', 'Unknown'))}</div>
+            <div class="network-score">关联强度 {_html_text(link.get('score', 0))}</div>
+            <div class="network-reason">{_html_text(link.get('relation') or '文本相似')}</div>
           </div>
 """
-            )
-        topic_cards_html = f"""
-        <div class=\"topic-grid\">
-{"".join(topic_cards)}
-        </div>
-"""
+        )
 
-    topics_panel_html = ""
-    if lda_topics:
-        topics_panel_html = f"""
-      <article class="panel panel-full panel-topic">
-        <div class="panel-head">
-          <div class="panel-topline">
-            <div>
-              <span class="panel-tag">Topic Clusters</span>
-              <h2>LDA 主题聚类</h2>
-            </div>
-            <span class="panel-metric">主题数: {lda_topic_count}</span>
-          </div>
-          <p class="panel-desc">基于 LDA 的主题聚类与话题占比概览。</p>
-        </div>
-        <div id="topics" class="chart chart-md"></div>
-{topic_cards_html}
-      </article>
-"""
-
-    network_cards_html = ""
-    if network_highlights:
-        cards = []
-        for link in network_highlights:
-            relation = link.get("relation") or "文本相似"
-            cards.append(
-                f"""
-          <div class=\"network-card\">
-            <div class=\"network-pair\">{link.get('source', 'Unknown')} ↔ {link.get('target', 'Unknown')}</div>
-            <div class=\"network-score\">关联强度 {link.get('score', 0)}</div>
-            <div class=\"network-reason\">{relation}</div>
-          </div>
-"""
-            )
-        network_cards_html = f"""
-        <div class=\"network-grid\">
-{"".join(cards)}
-        </div>
-"""
-
-    network_panel_html = ""
     if network_nodes and network_links:
-        network_panel_html = f"""
-      <article class="panel panel-full panel-network">
-        <div class="panel-head">
-          <div class="panel-topline">
-            <div>
-              <span class="panel-tag">Author Network</span>
-              <h2>作者关联网络</h2>
-            </div>
-            <span class="panel-metric">节点 {network_node_count} · 连线 {network_edge_count}</span>
-          </div>
-          <p class="panel-desc">{network_note}</p>
-        </div>
-        <div id="author-network" class="chart chart-network"></div>
-{network_cards_html}
-      </article>
-"""
+        network_body = '<div id="author-network" class="chart chart-network"></div>'
+        network_body += f'<div class="network-grid">{"".join(network_cards)}</div>'
+        network_metric = f"节点 {len(network_nodes)} · 连线 {len(network_links)}"
+    else:
+        note = network_note or "当前样本未检测到足够强的作者关联。"
+        network_body = (
+            f'<div class="empty-state"><strong>本次未生成作者网络。</strong> '
+            f"{_html_text(note)}</div>"
+        )
+        network_metric = "已跳过"
+
+    network_panel = _dashboard_panel(
+        "Inferred Author Network",
+        "作者关联网络",
+        "基于主题、关键词与情感接近度推断；样本不足时自动跳过。",
+        network_metric,
+        network_body,
+        "col-12",
+    )
+
+    payload = {
+        "topKeywords": top_keywords,
+        "sentimentBuckets": sentiment_buckets,
+        "bucketOrder": bucket_order,
+        "timeline": timeline,
+        "scatter": scatter_points,
+        "ldaDistribution": lda_distribution,
+        "authorNetwork": author_network,
+    }
+
+    css_path = SKILL_ROOT / "assets" / "dashboard.css"
+    js_path = SKILL_ROOT / "assets" / "dashboard.js"
+    echarts_path = SKILL_ROOT / "assets" / "echarts.min.js"
+    dashboard_css = css_path.read_text(encoding="utf-8") if css_path.exists() else ""
+    dashboard_js = js_path.read_text(encoding="utf-8") if js_path.exists() else ""
+    if echarts_path.exists():
+        # Vendored copy keeps the generated dashboard fully offline-capable.
+        echarts_tag = f"<script>\n{echarts_path.read_text(encoding='utf-8')}\n  </script>"
+    else:
+        echarts_tag = (
+            '<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>'
+        )
+
+    if question_url:
+        source_html = (
+            f'<a class="source-link" href="{_html_text(question_url)}" '
+            'target="_blank" rel="noreferrer">查看原问题 ↗</a>'
+        )
+    else:
+        source_html = f'<span class="source-link">{_html_text(summary.get("source") or "本地数据")}</span>'
 
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{summary.get("question_title") or "Zhihu Dashboard"}</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <meta name="color-scheme" content="light dark">
+  <script>
+    (function () {{
+      try {{
+        var saved = window.localStorage.getItem("zhihu-report-theme");
+        if (saved === "dark" || saved === "light") {{
+          document.documentElement.setAttribute("data-theme", saved);
+        }}
+      }} catch (error) {{}}
+    }})();
+  </script>
+  <title>{_html_text(question_title)} · 知乎回答分析</title>
+  {echarts_tag}
   <style>
-    :root {{
-      color-scheme: light;
-      --bg: #f6f1e7;
-      --panel: #fffdf9;
-      --panel-soft: rgba(255, 255, 255, 0.78);
-      --ink: #1f2328;
-      --muted: #665f56;
-      --line: rgba(120, 95, 61, 0.16);
-      --accent: #c96d3a;
-      --accent-soft: rgba(201, 109, 58, 0.12);
-      --teal: #287271;
-      --blue: #4c7aaf;
-      --positive: #2f855a;
-      --neutral: #b08929;
-      --negative: #9b3d3d;
-      --shadow: 0 18px 48px rgba(67, 46, 22, 0.12);
-    }}
-    * {{
-      box-sizing: border-box;
-    }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      padding: clamp(18px, 3vw, 32px);
-      background:
-        radial-gradient(circle at top left, rgba(255, 228, 181, 0.8), transparent 30%),
-        radial-gradient(circle at top right, rgba(76, 122, 175, 0.18), transparent 24%),
-        linear-gradient(180deg, #fbf6ed 0%, var(--bg) 100%);
-      color: var(--ink);
-      font-family: "Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif;
-      position: relative;
-    }}
-    body::before {{
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background-image:
-        linear-gradient(rgba(108, 93, 72, 0.035) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(108, 93, 72, 0.035) 1px, transparent 1px);
-      background-size: 24px 24px;
-      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.42), transparent 72%);
-    }}
-    .shell {{
-      max-width: 1440px;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }}
-    .hero {{
-      display: flex;
-      align-items: stretch;
-      justify-content: space-between;
-      gap: 20px;
-      padding: clamp(22px, 3vw, 32px);
-      background:
-        linear-gradient(135deg, rgba(255, 244, 223, 0.96), rgba(255, 253, 249, 0.94)),
-        var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      position: relative;
-      isolation: isolate;
-    }}
-    .hero::after {{
-      content: "";
-      position: absolute;
-      right: -8%;
-      bottom: -36%;
-      width: 320px;
-      height: 320px;
-      border-radius: 999px;
-      background: radial-gradient(circle, rgba(76, 122, 175, 0.22), transparent 70%);
-      z-index: -1;
-    }}
-    .hero-copy {{
-      flex: 1;
-      min-width: 0;
-    }}
-    .hero-kicker {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      color: var(--accent);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }}
-    h1 {{
-      margin: 14px 0 10px;
-      font-size: clamp(30px, 5vw, 44px);
-      line-height: 1.08;
-    }}
-    .lead {{
-      margin: 0;
-      max-width: 64ch;
-      color: var(--muted);
-      font-size: 15px;
-      line-height: 1.7;
-    }}
-    .hero-meta {{
-      margin-top: 18px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-    }}
-    .meta-chip {{
-      min-width: 148px;
-      padding: 12px 14px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.74);
-      border: 1px solid rgba(120, 95, 61, 0.1);
-      box-shadow: 0 10px 24px rgba(67, 46, 22, 0.06);
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }}
-    .meta-chip span {{
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }}
-    .meta-chip strong {{
-      font-size: 16px;
-      line-height: 1.25;
-    }}
-    .hero-note {{
-      width: min(300px, 100%);
-      padding: 20px 22px;
-      border-radius: 24px;
-      background: var(--panel-soft);
-      border: 1px solid rgba(76, 122, 175, 0.18);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 10px;
-      backdrop-filter: blur(12px);
-    }}
-    .note-label,
-    .stat-label,
-    .panel-tag {{
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--accent);
-    }}
-    .note-value {{
-      font-size: clamp(26px, 3.5vw, 34px);
-      font-weight: 700;
-      line-height: 1.1;
-    }}
-    .hero-breakdown {{
-      display: grid;
-      gap: 10px;
-      margin-top: 8px;
-    }}
-    .breakdown-row {{
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      align-items: center;
-      gap: 10px;
-      font-size: 13px;
-      color: var(--muted);
-    }}
-    .breakdown-dot {{
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-    }}
-    .breakdown-dot.positive {{
-      background: var(--positive);
-    }}
-    .breakdown-dot.neutral {{
-      background: var(--neutral);
-    }}
-    .breakdown-dot.negative {{
-      background: var(--negative);
-    }}
-    .breakdown-row strong {{
-      color: var(--ink);
-    }}
-    .note-caption,
-    .stat-note,
-    .panel-desc {{
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.6;
-    }}
-    .stats {{
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 18px;
-    }}
-    .stat-card,
-    .panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      box-shadow: var(--shadow);
-    }}
-    .stat-card {{
-      padding: 18px 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }}
-    .stat-card:nth-child(1) {{
-      background: linear-gradient(180deg, rgba(201, 109, 58, 0.09), rgba(255, 253, 249, 0.96) 55%);
-    }}
-    .stat-card:nth-child(2) {{
-      background: linear-gradient(180deg, rgba(76, 122, 175, 0.1), rgba(255, 253, 249, 0.96) 55%);
-    }}
-    .stat-card:nth-child(3) {{
-      background: linear-gradient(180deg, rgba(40, 114, 113, 0.1), rgba(255, 253, 249, 0.96) 55%);
-    }}
-    .stat-card:nth-child(4) {{
-      background: linear-gradient(180deg, rgba(176, 137, 41, 0.11), rgba(255, 253, 249, 0.96) 55%);
-    }}
-    .stat-value {{
-      font-size: clamp(26px, 3.6vw, 38px);
-      font-weight: 700;
-      line-height: 1.05;
-    }}
-    .dashboard {{
-      display: grid;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-      gap: 18px;
-      align-items: stretch;
-    }}
-    .panel {{
-      grid-column: span 6;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-      overflow: hidden;
-    }}
-    .panel-heat {{
-      background: linear-gradient(180deg, rgba(201, 109, 58, 0.09), rgba(255, 253, 249, 0.98) 34%);
-    }}
-    .panel-tone {{
-      background: linear-gradient(180deg, rgba(40, 114, 113, 0.1), rgba(255, 253, 249, 0.98) 34%);
-    }}
-    .panel-rhythm {{
-      background: linear-gradient(180deg, rgba(76, 122, 175, 0.1), rgba(255, 253, 249, 0.98) 34%);
-    }}
-    .panel-map {{
-      background: linear-gradient(180deg, rgba(107, 29, 29, 0.08), rgba(255, 253, 249, 0.98) 34%);
-    }}
-    .panel-topic {{
-      background: linear-gradient(180deg, rgba(40, 114, 113, 0.08), rgba(255, 253, 249, 0.98) 34%);
-    }}
-    .panel-network {{
-      background: linear-gradient(180deg, rgba(76, 122, 175, 0.08), rgba(255, 253, 249, 0.98) 34%);
-    }}
-    .panel-wide {{
-      grid-column: span 7;
-    }}
-    .panel-narrow {{
-      grid-column: span 5;
-    }}
-    .panel-full {{
-      grid-column: span 12;
-    }}
-    .panel-head {{
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-bottom: 14px;
-    }}
-    .panel-topline {{
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
-    }}
-    .panel-head h2 {{
-      margin: 0;
-      font-size: 20px;
-      line-height: 1.25;
-    }}
-    .panel-metric {{
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 34px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.84);
-      border: 1px solid rgba(120, 95, 61, 0.12);
-      color: var(--ink);
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }}
-    .panel-topic .chart {{
-      margin-bottom: 14px;
-    }}
-    .topic-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-    }}
-    .topic-card {{
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(255, 255, 255, 0.82);
-      border: 1px solid rgba(120, 95, 61, 0.12);
-      box-shadow: 0 12px 24px rgba(67, 46, 22, 0.06);
-    }}
-    .topic-title {{
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--accent);
-    }}
-    .topic-words {{
-      margin-top: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--ink);
-      line-height: 1.45;
-    }}
-    .topic-meta {{
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--muted);
-    }}
-    .network-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 12px;
-    }}
-    .network-card {{
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(255, 255, 255, 0.82);
-      border: 1px solid rgba(120, 95, 61, 0.12);
-      box-shadow: 0 12px 24px rgba(67, 46, 22, 0.06);
-    }}
-    .network-pair {{
-      font-size: 14px;
-      font-weight: 700;
-      color: var(--ink);
-      line-height: 1.4;
-    }}
-    .network-score {{
-      margin-top: 6px;
-      font-size: 12px;
-      color: var(--accent);
-      font-weight: 700;
-    }}
-    .network-reason {{
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.55;
-    }}
-    .chart {{
-      width: 100%;
-      min-width: 0;
-    }}
-    .chart-lg {{
-      height: 420px;
-    }}
-    .chart-md {{
-      height: 380px;
-    }}
-    .chart-network {{
-      height: 560px;
-      margin-bottom: 14px;
-    }}
-    @media (max-width: 1180px) {{
-      .stats {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }}
-      .panel,
-      .panel-wide,
-      .panel-narrow {{
-        grid-column: span 6;
-      }}
-    }}
-    @media (max-width: 820px) {{
-      body {{
-        padding: 16px;
-      }}
-      .hero {{
-        flex-direction: column;
-      }}
-      .hero-note {{
-        width: 100%;
-      }}
-      .hero-meta {{
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }}
-      .stats {{
-        grid-template-columns: 1fr;
-      }}
-      .dashboard {{
-        grid-template-columns: 1fr;
-      }}
-      .panel,
-      .panel-wide,
-      .panel-narrow {{
-        grid-column: auto;
-      }}
-      .chart-lg,
-      .chart-md,
-      .chart-network {{
-        height: 320px;
-      }}
-      .panel-topline {{
-        flex-direction: column;
-      }}
-      .panel-metric {{
-        white-space: normal;
-      }}
-    }}
-    @media (max-width: 560px) {{
-      .hero-meta {{
-        grid-template-columns: 1fr;
-      }}
-    }}
+{dashboard_css}
   </style>
 </head>
 <body>
-  <main class="shell">
-    <section class="hero">
-      <div class="hero-copy">
-        <span class="hero-kicker">Zhihu Insight Dashboard</span>
-        <h1>{question_title}</h1>
-        <p class="lead">共分析 {summary.get("answer_count", 0)} 条回答，累计 {summary.get("total_characters", 0)} 字。看板默认采用双列卡片布局，在窄屏场景下自动切换为单列，避免图表被硬塞进同一行。</p>
-        <div class="hero-meta">
-          <article class="meta-chip">
-            <span>时间跨度</span>
-            <strong>{date_range_display}</strong>
-          </article>
-          <article class="meta-chip">
-            <span>活跃作者</span>
-            <strong>{author_count}</strong>
-          </article>
-          <article class="meta-chip">
-            <span>领跑关键词</span>
-            <strong>{leading_keyword}</strong>
-          </article>
-        </div>
+  <main class="page">
+    <header class="masthead">
+      <div class="masthead-bar">
+        <span class="brand"><span class="brand-mark"></span>知乎回答分析报告</span>
+        <span class="masthead-meta">
+          <span>NO. {_html_text(question_id or "—")}</span>
+          <span>{_html_text(generated_at[:10])}</span>
+          <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换深浅色主题">☾</button>
+        </span>
       </div>
-      <aside class="hero-note">
-        <span class="note-label">情绪切片</span>
-        <strong class="note-value">{average_sentiment_display}</strong>
-        <span class="note-caption">平均情感分，越接近 1 越偏正向。</span>
-        <div class="hero-breakdown">
-          <div class="breakdown-row">
-            <span class="breakdown-dot positive"></span>
-            <span>正向</span>
-            <strong>{positive_count}</strong>
-          </div>
-          <div class="breakdown-row">
-            <span class="breakdown-dot neutral"></span>
-            <span>中性</span>
-            <strong>{neutral_count}</strong>
-          </div>
-          <div class="breakdown-row">
-            <span class="breakdown-dot negative"></span>
-            <span>负向</span>
-            <strong>{negative_count}</strong>
-          </div>
-        </div>
-      </aside>
+      <h1 class="headline">{_html_text(question_title)}</h1>
+      <p class="dek">共分析 {_html_text(answer_count)} 条回答，累计 {_html_text(total_characters)} 字，覆盖 {_html_text(author_count)} 位作者。样本时间跨度为 {_html_text(date_range_display)}。</p>
+      <div class="masthead-foot">
+        {source_html}
+        <span class="dot">◆</span>
+        <span>生成于 {_html_text(generated_at)}</span>
+        <span class="dot">◆</span>
+        <span>情感均值 {_html_text(average_sentiment_display)}</span>
+      </div>
+    </header>
+
+    <section class="ledger" aria-label="关键指标">
+      <div class="ledger-item">
+        <span class="ledger-label">回答总数</span>
+        <strong class="ledger-value">{_html_text(answer_count)}</strong>
+        <span class="ledger-note">累计 {_html_text(total_characters)} 字</span>
+      </div>
+      <div class="ledger-item">
+        <span class="ledger-label">参与作者</span>
+        <strong class="ledger-value">{_html_text(author_count)}</strong>
+        <span class="ledger-note">样本内独立作者</span>
+      </div>
+      <div class="ledger-item">
+        <span class="ledger-label">平均篇幅</span>
+        <strong class="ledger-value">{_html_text(average_characters)}</strong>
+        <span class="ledger-note">中位数 {_html_text(median_characters)} 字</span>
+      </div>
+      <div class="ledger-item">
+        <span class="ledger-label">平均情感分</span>
+        <strong class="ledger-value">{_html_text(average_sentiment_display)}</strong>
+        <span class="ledger-note">正向 {_html_text(positive_count)} · 中性 {_html_text(neutral_count)} · 负向 {_html_text(negative_count)}</span>
+      </div>
     </section>
 
-    <section class="stats">
-      <article class="stat-card">
-        <span class="stat-label">回答总数</span>
-        <strong class="stat-value">{summary.get("answer_count", 0)}</strong>
-        <span class="stat-note">累计字数 {summary.get("total_characters", 0)}</span>
-      </article>
-      <article class="stat-card">
-        <span class="stat-label">活跃作者</span>
-        <strong class="stat-value">{author_count}</strong>
-        <span class="stat-note">报告正文会列出前 10 位高频作者</span>
-      </article>
-      <article class="stat-card">
-        <span class="stat-label">平均字数</span>
-        <strong class="stat-value">{summary.get("average_characters", 0)}</strong>
-        <span class="stat-note">中位数字数 {summary.get("median_characters", 0)}</span>
-      </article>
-      <article class="stat-card">
-        <span class="stat-label">平均情感分</span>
-        <strong class="stat-value">{average_sentiment_display}</strong>
-        <span class="stat-note">标准差 {summary.get("sentiment_stddev", "N/A")}</span>
-      </article>
+    <section class="notes" aria-label="核心结论">
+      <div class="notes-head">
+        <span class="section-index">00</span>
+        <h2>核心结论</h2>
+      </div>
+      <ol class="note-list">{notes_html}</ol>
     </section>
 
-    <section class="dashboard">
-      <article class="panel panel-wide panel-heat">
-        <div class="panel-head">
-          <div class="panel-topline">
-            <div>
-              <span class="panel-tag">Topic Language</span>
-              <h2>高频关键词 Top 20</h2>
-            </div>
-            <span class="panel-metric">Top 1: {leading_keyword}</span>
-          </div>
-          <p class="panel-desc">观察回答里的核心讨论主题与词频热度。</p>
-        </div>
-        <div id="keywords" class="chart chart-lg"></div>
-      </article>
+{_dashboard_section(
+        "01",
+        "主题语言",
+        "词频、情绪、时间与互动四个切面，构成这份样本的基本轮廓。",
+        f'<div class="grid">{keywords_panel}{sentiment_panel}{timeline_panel}{scatter_panel}</div>',
+    )}
+{_dashboard_section(
+        "02",
+        "主题聚类",
+        "LDA 从回答文本中归纳话题簇；样本不足时自动跳过并说明原因。",
+        f'<div class="grid">{topics_panel}</div>',
+    )}
+{_dashboard_section(
+        "03",
+        "作者网络",
+        "基于主题、关键词与情感接近度推断的作者关联，并非知乎真实社交关系。",
+        f'<div class="grid">{network_panel}</div>',
+    )}
 
-      <article class="panel panel-narrow panel-tone">
-        <div class="panel-head">
-          <div class="panel-topline">
-            <div>
-              <span class="panel-tag">Sentiment Curve</span>
-              <h2>情感分布</h2>
-            </div>
-            <span class="panel-metric">主峰: {dominant_bucket} / {dominant_bucket_count} 条</span>
-          </div>
-          <p class="panel-desc">按分数区间观察回答整体偏正向还是偏负向。</p>
-        </div>
-        <div id="sentiment" class="chart chart-lg"></div>
-      </article>
-
-      <article class="panel panel-narrow panel-rhythm">
-        <div class="panel-head">
-          <div class="panel-topline">
-            <div>
-              <span class="panel-tag">Activity Rhythm</span>
-              <h2>回答时间线</h2>
-            </div>
-            <span class="panel-metric">峰值: {timeline_peak_label}</span>
-          </div>
-          <p class="panel-desc">按日期查看回答发布节奏是否有集中爆发。</p>
-        </div>
-        <div id="timeline" class="chart chart-md"></div>
-      </article>
-
-      <article class="panel panel-wide panel-map">
-        <div class="panel-head">
-          <div class="panel-topline">
-            <div>
-              <span class="panel-tag">Engagement Map</span>
-              <h2>字数 / 赞同 / 情感</h2>
-            </div>
-            <span class="panel-metric">样本点: {scatter_count}</span>
-          </div>
-          <p class="panel-desc">同时观察篇幅、赞同数与情感分之间的关系。</p>
-        </div>
-        <div id="scatter" class="chart chart-md"></div>
-      </article>
-{topics_panel_html}
-{network_panel_html}
-    </section>
+    <footer class="colophon">
+      <span><strong>知乎回答分析报告</strong> · {_html_text(question_title)}</span>
+      <span>{_html_text(answer_count)} 条回答 · {_html_text(generated_at)}</span>
+    </footer>
   </main>
+
+  <script id="report-data" type="application/json">{_json_for_script(payload)}</script>
   <script>
-    const topKeywords = {json.dumps(top_keywords, ensure_ascii=False)};
-    const sentimentBuckets = {json.dumps(sentiment_buckets, ensure_ascii=False)};
-    const timeline = {json.dumps(timeline, ensure_ascii=False)};
-    const scatterPoints = {json.dumps(scatter_points, ensure_ascii=False)};
-    const ldaDistribution = {json.dumps(lda_distribution, ensure_ascii=False)};
-    const authorNetwork = {json.dumps(author_network, ensure_ascii=False)};
-    const bucketOrder = {json.dumps(bucket_order, ensure_ascii=False)};
-    const axisLabelColor = '#615949';
-    const splitLineColor = 'rgba(109, 94, 72, 0.16)';
-    const tooltipTheme = {{
-      backgroundColor: 'rgba(31, 26, 21, 0.94)',
-      borderWidth: 0,
-      padding: [10, 12],
-      textStyle: {{ color: '#fff', fontSize: 12 }}
-    }};
-
-    const keywordChart = echarts.init(document.getElementById('keywords'));
-    keywordChart.setOption({{
-      animationDuration: 700,
-      grid: {{ left: 48, right: 22, top: 16, bottom: 74 }},
-      tooltip: {{ ...tooltipTheme, trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
-      xAxis: {{
-        type: 'category',
-        data: topKeywords.map(item => item.word),
-        axisLabel: {{ rotate: 34, color: axisLabelColor }},
-        axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
-        axisTick: {{ show: false }}
-      }},
-      yAxis: {{
-        type: 'value',
-        axisLabel: {{ color: axisLabelColor }},
-        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
-      }},
-      series: [{{
-        type: 'bar',
-        data: topKeywords.map(item => item.count),
-        itemStyle: {{
-          color: '#c96d3a',
-          borderRadius: [10, 10, 0, 0],
-          shadowBlur: 14,
-          shadowColor: 'rgba(201, 109, 58, 0.18)'
-        }},
-        emphasis: {{ focus: 'series' }},
-        barMaxWidth: 28
-      }}]
-    }});
-
-    const sentimentChart = echarts.init(document.getElementById('sentiment'));
-    sentimentChart.setOption({{
-      animationDuration: 700,
-      grid: {{ left: 42, right: 18, top: 16, bottom: 42 }},
-      tooltip: {{ ...tooltipTheme, trigger: 'axis' }},
-      xAxis: {{
-        type: 'category',
-        data: bucketOrder,
-        axisLabel: {{ color: axisLabelColor }},
-        axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
-        axisTick: {{ show: false }}
-      }},
-      yAxis: {{
-        type: 'value',
-        axisLabel: {{ color: axisLabelColor }},
-        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
-      }},
-      series: [{{
-        type: 'line',
-        smooth: true,
-        data: bucketOrder.map(name => sentimentBuckets[name] || 0),
-        lineStyle: {{ color: '#287271', width: 3 }},
-        areaStyle: {{ color: 'rgba(40, 114, 113, 0.18)' }},
-        itemStyle: {{ color: '#287271' }},
-        symbol: 'circle',
-        symbolSize: 8
-      }}]
-    }});
-
-    const timelineChart = echarts.init(document.getElementById('timeline'));
-    timelineChart.setOption({{
-      animationDuration: 700,
-      grid: {{ left: 48, right: 18, top: 16, bottom: 74 }},
-      tooltip: {{ ...tooltipTheme, trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
-      xAxis: {{
-        type: 'category',
-        data: timeline.map(item => item.date),
-        axisLabel: {{ rotate: 34, color: axisLabelColor }},
-        axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
-        axisTick: {{ show: false }}
-      }},
-      yAxis: {{
-        type: 'value',
-        axisLabel: {{ color: axisLabelColor }},
-        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
-      }},
-      series: [{{
-        type: 'bar',
-        data: timeline.map(item => item.count),
-        itemStyle: {{
-          color: '#4c7aaf',
-          borderRadius: [10, 10, 0, 0],
-          shadowBlur: 16,
-          shadowColor: 'rgba(76, 122, 175, 0.18)'
-        }},
-        barMaxWidth: 26
-      }}]
-    }});
-
-    const scatterChart = echarts.init(document.getElementById('scatter'));
-    scatterChart.setOption({{
-      animationDuration: 700,
-      grid: {{ left: 76, right: 56, top: 28, bottom: 120, containLabel: true }},
-      tooltip: {{
-        ...tooltipTheme,
-        formatter: params => {{
-          const data = params.data;
-          const title = data[3] || '未命名回答';
-          return `${{title}}<br>字数: ${{data[0]}}<br>赞同: ${{data[1]}}<br>情感: ${{data[2]}}`;
-        }}
-      }},
-      xAxis: {{
-        type: 'value',
-        name: '字数',
-        nameLocation: 'middle',
-        nameTextStyle: {{ color: axisLabelColor, fontSize: 12 }},
-        axisLabel: {{ color: axisLabelColor, margin: 12, fontSize: 11 }},
-        nameGap: 32,
-        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
-      }},
-      yAxis: {{
-        type: 'value',
-        name: '赞同数',
-        nameLocation: 'middle',
-        nameTextStyle: {{ color: axisLabelColor, fontSize: 12 }},
-        axisLabel: {{ color: axisLabelColor, margin: 12, fontSize: 11 }},
-        nameGap: 46,
-        splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
-      }},
-      visualMap: {{
-        min: 0,
-        max: 1,
-        dimension: 2,
-        orient: 'horizontal',
-        left: 'center',
-        bottom: 14,
-        textStyle: {{ color: axisLabelColor, fontSize: 11 }},
-        itemWidth: 14,
-        itemHeight: 90,
-        textGap: 6,
-        inRange: {{ color: ['#6b1d1d', '#d6c65b', '#276749'] }}
-      }},
-      series: [{{
-        type: 'scatter',
-        symbolSize: value => Math.min(52, Math.max(10, Math.sqrt(value[1] + 1) * 3)),
-        itemStyle: {{
-          borderColor: 'rgba(255, 255, 255, 0.9)',
-          borderWidth: 1,
-          opacity: 0.9
-        }},
-        data: scatterPoints
-      }}]
-    }});
-
-    const charts = [keywordChart, sentimentChart, timelineChart, scatterChart];
-    const topicEl = document.getElementById('topics');
-    if (topicEl && ldaDistribution.length) {{
-      const topicChart = echarts.init(topicEl);
-      topicChart.setOption({{
-        animationDuration: 700,
-        grid: {{ left: 72, right: 26, top: 28, bottom: 110, containLabel: true }},
-        tooltip: {{
-          ...tooltipTheme,
-          formatter: params => {{
-            const data = params.data;
-            const keywords = data[2] ? `<br>关键词: ${{data[2]}}` : '';
-            return `${{data[0]}}<br>回答数: ${{data[1]}}${{keywords}}`;
-          }}
-        }},
-        xAxis: {{
-          type: 'category',
-          data: ldaDistribution.map(item => item.topic),
-          axisLabel: {{ color: axisLabelColor, rotate: 18, margin: 12, fontSize: 11 }},
-          axisLine: {{ lineStyle: {{ color: '#cdbba5' }} }},
-          axisTick: {{ show: false }}
-        }},
-        yAxis: {{
-          type: 'value',
-          name: '回答数',
-          nameGap: 30,
-          axisLabel: {{ color: axisLabelColor, margin: 10, fontSize: 11 }},
-          splitLine: {{ lineStyle: {{ color: splitLineColor }} }}
-        }},
-        series: [{{
-          type: 'bar',
-          data: ldaDistribution.map(item => [item.topic, item.count, item.keywords]),
-          itemStyle: {{
-            color: '#287271',
-            borderRadius: [10, 10, 0, 0],
-            shadowBlur: 14,
-            shadowColor: 'rgba(40, 114, 113, 0.18)'
-          }},
-          barMaxWidth: 32,
-          label: {{
-            show: true,
-            position: 'top',
-            color: axisLabelColor,
-            fontSize: 11,
-            lineHeight: 14,
-            formatter: params => {{
-              const keywords = params.data[2] || '';
-              return keywords ? keywords.split(/\\s+/).join(' · ') : '';
-            }}
-          }},
-          labelLayout: {{
-            hideOverlap: true,
-            moveOverlap: 'shiftY'
-          }}
-        }}]
-      }});
-      charts.push(topicChart);
-    }}
-    const networkEl = document.getElementById('author-network');
-    if (networkEl && authorNetwork.nodes && authorNetwork.nodes.length) {{
-      const networkChart = echarts.init(networkEl);
-      networkChart.setOption({{
-        animationDuration: 700,
-        color: ['#4c7aaf', '#287271', '#c96d3a', '#b08929', '#9b3d3d', '#6f5b8c'],
-        tooltip: {{
-          ...tooltipTheme,
-          formatter: params => {{
-            if (params.dataType === 'edge') {{
-              const data = params.data;
-              return `${{data.source}} ↔ ${{data.target}}<br>强度: ${{data.value}}<br>${{data.relation || '文本相似'}}`;
-            }}
-            const data = params.data;
-            return `${{data.name}}<br>回答数: ${{data.answers}}<br>总赞同: ${{data.upvotes}}<br>主主题: ${{data.topic}}<br>关键词: ${{data.keywords}}<br>平均情感: ${{data.avg_sentiment}}`;
-          }}
-        }},
-        legend: authorNetwork.categories.length > 1
-          ? [{{
-              top: 8,
-              left: 'center',
-              itemWidth: 10,
-              itemHeight: 10,
-              textStyle: {{ color: axisLabelColor, fontSize: 11 }},
-              data: authorNetwork.categories.map(item => item.name)
-            }}]
-          : [],
-        series: [{{
-          type: 'graph',
-          layout: 'force',
-          roam: true,
-          draggable: true,
-          data: authorNetwork.nodes,
-          links: authorNetwork.links,
-          categories: authorNetwork.categories,
-          edgeSymbol: ['none', 'none'],
-          label: {{
-            show: true,
-            position: 'right',
-            color: axisLabelColor,
-            fontSize: 11
-          }},
-          lineStyle: {{
-            color: 'source',
-            curveness: 0.16
-          }},
-          emphasis: {{
-            focus: 'adjacency',
-            lineStyle: {{
-              width: 4
-            }}
-          }},
-          force: {{
-            repulsion: 260,
-            gravity: 0.08,
-            edgeLength: [70, 180]
-          }}
-        }}]
-      }});
-      charts.push(networkChart);
-    }}
-    const syncFrameHeight = () => {{
-      const frame = window.frameElement;
-      if (!frame) {{
-        return;
-      }}
-      try {{
-        frame.style.height = `${{document.documentElement.scrollHeight + 24}}px`;
-      }} catch (_error) {{
-        // Ignore iframe sizing failures when opened directly.
-      }}
-    }};
-
-    const resizeCharts = () => {{
-      charts.forEach(chart => chart.resize());
-      syncFrameHeight();
-    }};
-
-    window.addEventListener('load', syncFrameHeight);
-    window.addEventListener('resize', resizeCharts);
-    if ('ResizeObserver' in window) {{
-      const observer = new ResizeObserver(() => syncFrameHeight());
-      observer.observe(document.body);
-    }}
-    setTimeout(syncFrameHeight, 300);
-    setTimeout(syncFrameHeight, 900);
+{dashboard_js}
   </script>
+  <noscript><p class="empty-state">本页图表需要 JavaScript；Markdown 报告中的表格仍可阅读。</p></noscript>
 </body>
 </html>
 """
@@ -1967,28 +1471,69 @@ def make_relative_link(target: str | Path, base_dir: Path) -> str:
     return os.path.relpath(str(target), start=str(base_dir))
 
 
+def _md_cell(value: Any) -> str:
+    """Keep Markdown table cells on one line and neutralize inline HTML."""
+    text = "" if value is None else str(value)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _md_target(path: str | Path, base_dir: Path) -> str:
+    """Percent-encode a local relative path so spaces and CJK survive Markdown."""
+    relative = make_relative_link(path, base_dir).replace(os.sep, "/")
+    return quote(relative, safe="/")
+
+
 def build_key_findings(summary: dict[str, Any]) -> list[str]:
+    answer_count = summary.get("answer_count", 0)
+    author_count = summary.get("author_count", 0)
+    total_characters = summary.get("total_characters", 0)
     findings = [
-        f"共分析 {summary['answer_count']} 条回答，累计 {summary['total_characters']} 字。",
-        f"平均回答长度为 {summary['average_characters']} 字，中位数为 {summary['median_characters']} 字。",
+        f"共分析 {answer_count} 条回答、{author_count} 位作者，累计 {total_characters} 字。",
+        (
+            f"单条回答平均 {summary.get('average_characters', 0)} 字，"
+            f"中位数 {summary.get('median_characters', 0)} 字，"
+            f"最长 {summary.get('max_characters', 0)} 字、最短 {summary.get('min_characters', 0)} 字。"
+        ),
     ]
-    if summary.get("average_sentiment") is not None:
+
+    average_sentiment = summary.get("average_sentiment")
+    labels = summary.get("sentiment_labels") or {}
+    if average_sentiment is not None:
+        if average_sentiment >= 0.65:
+            tone = "整体偏正向"
+        elif average_sentiment <= 0.35:
+            tone = "整体偏负向"
+        else:
+            tone = "整体接近中性"
         findings.append(
-            "SnowNLP 平均情感分为 "
-            f"{summary['average_sentiment']}，正向 {summary['sentiment_labels'].get('positive', 0)} 条，"
-            f"中性 {summary['sentiment_labels'].get('neutral', 0)} 条，"
-            f"负向 {summary['sentiment_labels'].get('negative', 0)} 条。"
+            f"SnowNLP 平均情感分 {average_sentiment}，{tone}；"
+            f"正向 {labels.get('positive', 0)} 条、中性 {labels.get('neutral', 0)} 条、"
+            f"负向 {labels.get('negative', 0)} 条。"
         )
-    keywords = ", ".join(item["word"] for item in summary["top_keywords"][:8])
+
+    keywords = "、".join(item["word"] for item in summary.get("top_keywords", [])[:6])
     if keywords:
-        findings.append(f"最显著的高频词包括：{keywords}。")
+        findings.append(f"高频词集中在：{keywords}。")
+
+    topics = summary.get("lda_topics") or []
+    if topics:
+        leading_topic = max(topics, key=lambda item: item.get("doc_count", 0))
+        words = "、".join(leading_topic.get("top_words", [])[:4])
+        share = float(leading_topic.get("doc_share") or 0) * 100
+        findings.append(
+            f"LDA 归纳出 {len(topics)} 个主题，覆盖最多的是 Topic {leading_topic.get('topic_id')}"
+            f"（{leading_topic.get('doc_count', 0)} 条，{share:.1f}%），关键词为 {words}。"
+        )
+
     network_highlights = summary.get("author_network_highlights") or []
     if network_highlights:
         top_link = network_highlights[0]
         findings.append(
-            f"作者关联网络中，{top_link['source']} 与 {top_link['target']} 的相似度最高，"
-            f"线索为 {top_link['shared_keywords']}。"
+            f"作者关联网络里，{top_link['source']} 与 {top_link['target']} 的推断关联最强，"
+            f"依据为 {top_link.get('shared_keywords') or '同主题'}。"
         )
+
     return findings
 
 
@@ -1997,46 +1542,75 @@ def write_report(
     summary: dict[str, Any],
     output_dir: Path,
 ) -> None:
-    wordcloud_rel = make_relative_link(output_dir / "analysis" / "wordcloud.png", report_path.parent)
-    dashboard_rel = make_relative_link(output_dir / "analysis" / "dashboard.html", report_path.parent)
-    summary_rel = make_relative_link(output_dir / "analysis" / "summary.json", report_path.parent)
-    dataset_rel = make_relative_link(output_dir / "analysis" / "answers.jsonl", report_path.parent)
+    wordcloud_rel = _md_target(output_dir / "analysis" / "wordcloud.png", report_path.parent)
+    dashboard_rel = _md_target(output_dir / "analysis" / "dashboard.html", report_path.parent)
+    summary_rel = _md_target(output_dir / "analysis" / "summary.json", report_path.parent)
+    dataset_rel = _md_target(output_dir / "analysis" / "answers.jsonl", report_path.parent)
+
+    question_title = summary.get("question_title") or "知乎回答分析报告"
+    question_url = summary.get("question_url") or ""
+    labels = summary.get("sentiment_labels") or {}
+    date_range = summary.get("date_range") or {}
+    if date_range.get("start") and date_range.get("end"):
+        date_range_display = (
+            f"{date_range['start']} — {date_range['end']}"
+            if date_range["start"] != date_range["end"]
+            else date_range["start"]
+        )
+    else:
+        date_range_display = "未提供"
 
     lines = [
-        f"# {summary.get('question_title') or '知乎回答分析报告'}",
+        f"# {_md_cell(question_title)}",
         "",
-        f"> **Generated At / 生成时间**: {summary['generated_at']}  ",
-        f"> **Source / 输入来源**: `{summary.get('source')}`  ",
-        f"> **Question URL / 问题链接**: {summary.get('question_url') or 'N/A'}  ",
-        f"> **Answer Count / 回答数**: {summary['answer_count']}",
+        f"> **生成时间**：{summary['generated_at']}  ",
+        f"> **输入来源**：`{summary.get('source')}`  ",
+        f"> **问题链接**：{question_url or 'N/A'}  ",
+        (
+            f"> **样本规模**：{summary['answer_count']} 条回答 · "
+            f"{summary.get('author_count', 0)} 位作者 · "
+            f"{summary['total_characters']} 字 · {date_range_display}"
+        ),
+        "",
+        "> 阅读顺序：核心结论 → 数据概览 → 词云与高频词 → 主题聚类 → 作者网络 → 可视化看板 → 情感分析 → 代表性回答。",
+        "",
+        "---",
         "",
         "## 核心结论",
         "",
     ]
 
     for finding in build_key_findings(summary):
-        lines.append(f"- {finding}")
+        lines.append(f"- {_md_cell(finding)}")
 
     lines.extend(
         [
+            "",
+            "---",
             "",
             "## 数据概览",
             "",
             "| 指标 | 数值 |",
             "|---|---|",
             f"| 回答数 | {summary['answer_count']} |",
+            f"| 作者数 | {summary.get('author_count', 0)} |",
             f"| 总字数 | {summary['total_characters']} |",
             f"| 平均字数 | {summary['average_characters']} |",
             f"| 中位数字数 | {summary['median_characters']} |",
+            f"| 最长回答 | {summary.get('max_characters', 0)} 字 |",
+            f"| 最短回答 | {summary.get('min_characters', 0)} 字 |",
+            f"| 时间跨度 | {_md_cell(date_range_display)} |",
             f"| 平均情感分 | {summary.get('average_sentiment', 'N/A')} |",
             f"| 情感标准差 | {summary.get('sentiment_stddev', 'N/A')} |",
-            f"| 正向回答数 | {summary['sentiment_labels'].get('positive', 0)} |",
-            f"| 中性回答数 | {summary['sentiment_labels'].get('neutral', 0)} |",
-            f"| 负向回答数 | {summary['sentiment_labels'].get('negative', 0)} |",
+            f"| 正向 / 中性 / 负向 | {labels.get('positive', 0)} / {labels.get('neutral', 0)} / {labels.get('negative', 0)} |",
+            "",
+            "---",
             "",
             "## 词云与高频词",
             "",
             f"![词云图]({wordcloud_rel})",
+            "",
+            "*图：按词频加权的关键词词云，字号越大表示在样本中出现越频繁。*",
             "",
             "| 关键词 | 频次 |",
             "|---|---|",
@@ -2044,15 +1618,9 @@ def write_report(
     )
 
     for item in summary["top_keywords"][:20]:
-        lines.append(f"| {item['word']} | {item['count']} |")
+        lines.append(f"| {_md_cell(item['word'])} | {item['count']} |")
 
-    lines.extend(
-        [
-            "",
-            "## 主题聚类 (LDA)",
-            "",
-        ]
-    )
+    lines.extend(["", "---", "", "## 主题聚类 (LDA)", ""])
 
     if summary.get("lda_topics"):
         lines.extend(
@@ -2063,27 +1631,23 @@ def write_report(
         )
         for topic in summary["lda_topics"]:
             words = "、".join(topic.get("top_words", []))
+            share = float(topic.get("doc_share") or 0) * 100
             lines.append(
-                f"| Topic {topic['topic_id']} | {words} | {topic.get('doc_count', 0)} | {topic.get('doc_share', 0)} |"
+                f"| Topic {topic['topic_id']} | {_md_cell(words)} | "
+                f"{topic.get('doc_count', 0)} | {share:.1f}% |"
             )
     else:
         note = summary.get("lda_note") or "未启用 LDA 或数据不足，未生成主题聚类结果。"
-        lines.append(note)
+        lines.append(_md_cell(note))
 
-    lines.extend(
-        [
-            "",
-            "## 作者关联网络",
-            "",
-        ]
-    )
+    lines.extend(["", "---", "", "## 作者关联网络", ""])
 
-    author_network_highlights = summary.get("author_network_highlights") or []
     author_network_note = summary.get("author_network_note") or (
         "作者关系图基于主题与关键词相似度推断，不代表知乎真实关注或互动关系。"
     )
-    lines.append(author_network_note)
+    lines.append(_md_cell(author_network_note))
 
+    author_network_highlights = summary.get("author_network_highlights") or []
     if author_network_highlights:
         lines.extend(
             [
@@ -2093,26 +1657,50 @@ def write_report(
             ]
         )
         for item in author_network_highlights:
-            relation = (item.get("relation") or "").replace("|", "\\|")
             lines.append(
-                f"| {item.get('source', '').replace('|', '\\|')} | "
-                f"{item.get('target', '').replace('|', '\\|')} | "
-                f"{item.get('score', 0)} | {relation} |"
+                f"| {_md_cell(item.get('source', ''))} | "
+                f"{_md_cell(item.get('target', ''))} | "
+                f"{item.get('score', 0)} | {_md_cell(item.get('relation') or '')} |"
             )
     else:
-        lines.extend(
-            [
-                "",
-                "当前样本中未检测到足够强的作者关联边，暂不输出关系对。",
-            ]
-        )
+        if not summary.get("author_network_note"):
+            lines.extend(["", "当前样本中未检测到足够强的作者关联边，暂不输出关系对。"])
 
     lines.extend(
         [
             "",
+            "---",
+            "",
+            "## ECharts 可视化",
+            "",
+            f"[在新窗口打开交互式看板]({dashboard_rel})",
+            "",
+            "> 看板支持浅色/深色主题切换。若预览器不允许嵌入 iframe，请使用上面的链接直接打开。",
+            "",
+            '<div style="margin: 16px 0 24px;">',
+            f'<iframe id="zhihu-dashboard" src="{dashboard_rel}" title="ECharts Dashboard" '
+            'style="width: 100%; height: 3200px; border: 1px solid #d8cdb8; border-radius: 2px; background: #fbf7ee;" '
+            'loading="lazy"></iframe>',
+            "</div>",
+            "<script>",
+            "(function () {",
+            '  var frame = document.getElementById("zhihu-dashboard");',
+            "  if (!frame) { return; }",
+            '  window.addEventListener("message", function (event) {',
+            "    if (event.source !== frame.contentWindow) { return; }",
+            "    var data = event.data || {};",
+            '    if (data.type === "zhihu-dashboard-height" && typeof data.height === "number") {',
+            '      frame.style.height = Math.max(1600, Math.min(data.height, 14000)) + "px";',
+            "    }",
+            "  });",
+            "})();",
+            "</script>",
+            "",
+            "---",
+            "",
             "## 情感分析",
             "",
-            "情感分使用 SnowNLP 生成，范围接近 0 到 1。分值越接近 1，文本越偏正向；越接近 0，文本越偏负向。",
+            "情感分由 SnowNLP 生成，取值范围接近 0 到 1：越接近 1 越偏正向，越接近 0 越偏负向。",
             "",
             "| 区间 | 回答数 |",
             "|---|---|",
@@ -2120,24 +1708,14 @@ def write_report(
     )
 
     for bucket in ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0", "unknown"]:
-        lines.append(f"| {bucket} | {summary['sentiment_buckets'].get(bucket, 0)} |")
+        name = "未知" if bucket == "unknown" else bucket
+        lines.append(f"| {name} | {summary['sentiment_buckets'].get(bucket, 0)} |")
 
     lines.extend(
         [
             "",
-            "## ECharts 可视化",
+            "---",
             "",
-            "<div style=\"margin: 16px 0 24px;\">",
-            f"<iframe src=\"{dashboard_rel}\" title=\"ECharts Dashboard\" "
-            "style=\"width: 100%; min-height: 2580px; border: 1px solid #e5e7eb; border-radius: 16px; background: #ffffff;\" "
-            "loading=\"lazy\"></iframe>",
-            "</div>",
-            "",
-        ]
-    )
-
-    lines.extend(
-        [
             "## 高频作者",
             "",
             "| 作者 | 回答数 |",
@@ -2146,37 +1724,49 @@ def write_report(
     )
 
     for item in summary["top_authors"][:10]:
-        lines.append(f"| {item['author']} | {item['count']} |")
+        lines.append(f"| {_md_cell(item['author'])} | {item['count']} |")
 
     lines.extend(
         [
             "",
+            "---",
+            "",
             "## 代表性回答",
             "",
-            "| 标题 | 作者 | 日期 | 赞同数 | 字数 | 情感分 | Markdown |",
+            "按赞同数排序；缺少赞同数据时按篇幅排序。",
+            "",
+            "| 标题 | 作者 | 日期 | 赞同数 | 字数 | 情感分 | 原文 |",
             "|---|---|---|---|---|---|---|",
         ]
     )
 
     for item in summary["top_answers"]:
-        markdown_rel = make_relative_link(item["markdown_path"], report_path.parent)
-        safe_title = item["title"].replace("|", "\\|")
-        safe_author = item["author"].replace("|", "\\|")
+        markdown_target = _md_target(item["markdown_path"], report_path.parent)
         lines.append(
-            f"| {safe_title} | {safe_author} | {item.get('date') or ''} | "
+            f"| {_md_cell(item['title'])} | {_md_cell(item['author'])} | "
+            f"{_md_cell(item.get('date') or '')} | "
             f"{item.get('upvotes') if item.get('upvotes') is not None else 'N/A'} | "
             f"{item.get('char_count', 0)} | "
             f"{item.get('sentiment') if item.get('sentiment') is not None else 'N/A'} | "
-            f"[index.md]({markdown_rel}) |"
+            f"[index.md]({markdown_target}) |"
         )
 
     lines.extend(
         [
             "",
+            "---",
+            "",
             "## 数据文件",
             "",
             f"- [结构化摘要 summary.json]({summary_rel})",
             f"- [答案数据 answers.jsonl]({dataset_rel})",
+            f"- [交互式看板 dashboard.html]({dashboard_rel})",
+            "",
+            "---",
+            "",
+            "> **方法与局限**：词频经 jieba 分词并过滤停用词；情感分来自 SnowNLP 的通用语料模型，"
+            "对反讽、行业黑话和长文本的判断可能偏差；LDA 主题与作者网络均为统计推断，"
+            "作者网络只反映文本相似度，不代表知乎真实关注、评论或私下社交关系。",
         ]
     )
 

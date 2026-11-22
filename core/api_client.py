@@ -13,15 +13,81 @@ api_client.py — 纯协议层知乎 API 客户端 (v3.0 核弹)
 """
 
 import json
+import os
+import re
+import subprocess
+import sys
 import urllib.parse
 from pathlib import Path
 from typing import Optional, Dict
 
 import execjs
-from curl_cffi import requests
+from curl_cffi import requests, CurlOpt
 
 from .config import get_logger
 from .cookie_manager import cookie_manager
+
+
+def _is_usable_dns_server(address: str) -> bool:
+    """Reject addresses libcurl/c-ares cannot query reliably (e.g. scoped link-local)."""
+    if not address:
+        return False
+    # fe80::...%en1 style link-local addresses need a scope id that c-ares cannot use.
+    if address.lower().startswith("fe80:") or "%" in address:
+        return False
+    return True
+
+
+def detect_dns_servers() -> Optional[str]:
+    """
+    Detect usable DNS servers for curl_cffi.
+
+    libcurl bundled with curl_cffi uses c-ares on macOS and does not consult the
+    system resolver, which can make every request fail with "Resolving timed
+    out". Passing the system nameservers (plus a public fallback) explicitly
+    fixes that without hurting platforms where resolution already works.
+
+    依次使用环境变量、系统 DNS 配置和公共 DNS，返回逗号分隔的服务器列表。
+    """
+    override = os.environ.get("ZHIHU_DNS_SERVERS", "").strip()
+    if override:
+        return override
+    if os.environ.get("ZHIHU_DISABLE_DNS_FIX", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return None
+
+    servers: list[str] = []
+
+    def add(address: str) -> None:
+        address = address.strip()
+        if _is_usable_dns_server(address) and address not in servers:
+            servers.append(address)
+
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.run(
+                ["scutil", "--dns"], capture_output=True, text=True, timeout=3
+            ).stdout
+            for line in output.splitlines():
+                match = re.search(r"nameserver\[\d+\]\s*:\s*(\S+)", line)
+                if match:
+                    add(match.group(1))
+        except Exception:
+            pass
+    else:
+        try:
+            for line in Path("/etc/resolv.conf").read_text(encoding="utf-8", errors="ignore").splitlines():
+                match = re.match(r"\s*nameserver\s+(\S+)", line)
+                if match:
+                    add(match.group(1))
+        except Exception:
+            pass
+
+    # Public fallbacks keep resolution working on machines with unusable
+    # system nameservers. Alibaba/Tencent first for mainland CDN accuracy.
+    for fallback in ("223.5.5.5", "119.29.29.29", "1.1.1.1"):
+        add(fallback)
+
+    return ",".join(servers[:4]) or None
 
 # Default global JS signature interpreter path
 # 默认全局 JS 签名解释器路径
@@ -52,7 +118,16 @@ class ZhihuAPIClient:
 
         # Re-initialize underlying curl handshake even when switching proxies
         # 即使只切代理也重新初始化底层的 curl 握手
-        self.session = requests.Session(impersonate="chrome110")
+        curl_options = {}
+        dns_servers = detect_dns_servers()
+        if dns_servers:
+            curl_options[CurlOpt.DNS_SERVERS] = dns_servers
+        try:
+            self.session = requests.Session(impersonate="chrome110", curl_options=curl_options)
+        except Exception as exc:
+            # Older libcurl builds may not support CURLOPT_DNS_SERVERS.
+            self.log.warning("dns_servers_option_unsupported", error=str(exc))
+            self.session = requests.Session(impersonate="chrome110")
 
         # Base request headers / 基础请求头
         self.session.headers.update({
